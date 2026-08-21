@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+env/
+
+# never commit weights, data or run outputs
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# shared model weights live here; they are distributed separately, never committed
+weights/*
+!weights/README.md
+*.h5ad
+*.npz
+*.npy
+*.tif
+*.tiff
+*.svs
+*.ndpi
+logs/
+outputs/
+_verify_*/
+configs/local.yaml
+
+# cluster-specific filled-in paths, shared with collaborators out of band
+local/*
+!local/README.md
