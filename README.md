@@ -180,10 +180,12 @@ tests/           parity test: the packaged forward reproduces the published pred
 
 If you find VOICE useful in your research, please cite:
 
+```
 @article{luo2026voice,
-  title   = {VOICE: A Vision-Omics Foundation Model Integrating Direct and Retrieval-Based Prediction of In-situ Single-Cell Gene Expression},
-  author  = {Luo, Xin and Tao, Yicheng and Zeng, Haoxuan and Wang, Suyuan and Ouyang, Chenzi and Zhu, Meiqi and Liu, Kai and Chen, Shuibing and Liu, Jie},
-  journal = {arXiv preprint arXiv:2608.08366},
-  year    = {2026}
+  title={VOICE: A Vision-Omics Foundation Model Integrating Direct and Retrieval-Based Prediction of In-situ Single-Cell Gene Expression},
+  author={Luo, Xin and Tao, Yicheng and Zeng, Haoxuan and Wang, Suyuan and Ouyang, Chenzi and Zhu, Meiqi and Liu, Kai and Chen, Shuibing and Liu, Jie},
+  journal={arXiv preprint arXiv:2608.08366},
+  year={2026}
 }
+```
 
