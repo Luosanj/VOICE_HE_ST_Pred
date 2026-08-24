@@ -60,6 +60,23 @@ The prepared path decodes one PNG per cell, so it is CPU-bound. On a 4-core node
 also sits in `weights/voice-23m/` inside the repo (git-ignored). The image encoder is **not** included: VOICE
 adapts MahmoodLab/UNI2-h, which is gated — `env.sh` points `HF_HOME` at a cache that already has it.
 
+## Stage 3 (optional)
+
+The fused prediction needs a bank of same-tissue reference slides with measured expression, plus a gate fitted
+on them. The five prepared slides above are all *different* tissues, so there is no ready-made bank here — build
+one when you have two or more reference slides of one tissue:
+
+```bash
+$PY predict/build_bank.py --release $VOICE_RELEASE --bank_dir bank/<tissue> \
+    --global_genes $VOICE_RELEASE/genes.tsv --prepared <ref_a> <ref_b>
+$PY benchmark/fit_gate.py --release $VOICE_RELEASE --bank bank/<tissue> \
+    --prepared <ref_a> <ref_b> --out gate_<tissue>.json
+$PY predict/predict.py --prepared <target> --release $VOICE_RELEASE \
+    --bank bank/<tissue> --gate gate_<tissue>.json --out target.h5ad
+```
+
+The bank must exclude the target slide, and must be embedded with the same weights (both are checked).
+
 ## Benchmark
 
 `benchmark/*.py` scores a model against measured expression and needs slides in the benchmark layout

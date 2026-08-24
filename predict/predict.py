@@ -27,9 +27,15 @@ which are a lossy view of it. With `--embeddings_only` the gene head is skipped 
 Cells are grouped into non-overlapping 256-px tiles so each is predicted once with its neighbours as spatial
 context, matching the evaluation protocol.
 
-This runs the direct branch (Stages 1-2). The retrieval branch and the Stage-3 gate need a reference bank of
-millions of embedded cells from the same tissue, which cannot ship with the code; `benchmark/` shows how to build
-one from your own reference slides.
+**Stage 3.** With `--bank` the retrieval branch runs too, and `--gate` fuses the two per gene. Both are
+optional: without them you get the direct branch alone, which is what a slide with no reference cohort can
+have. Build a bank with `predict/build_bank.py`, and fit a gate with `benchmark/fit_gate.py`; the bank must be
+same-tissue, must exclude this slide, and must be embedded with these weights.
+
+    X            the fused prediction when a bank and gate are given, else the direct branch
+    layers["A"]  direct branch
+    layers["R"]  retrieval branch, NaN where no bank slide measures the gene
+    var["beta"]  the per-gene weight actually used
 """
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
@@ -43,6 +49,28 @@ from torch.utils.data import Dataset, DataLoader
 from voice.encoder import pooled_feat, MEAN, STD
 from predict.geometry import tile, FOV_UM
 from predict.inputs import open_slide
+
+
+def panel_global_ids(release, genes_tsv, n_genes):
+    """Global gene ids for the head's output columns, in head order.
+
+    Retrieval needs to know WHICH gene each output column is, so it can ask the bank whether any reference
+    slide measures it. The head's gene table is that mapping.
+    """
+    import pandas as pd
+    p = genes_tsv or (os.path.join(release, "genes.tsv") if release else None)
+    if not (p and os.path.exists(p)):
+        raise SystemExit("retrieval needs the head's gene table: pass --genes, or use a --release that ships "
+                         "genes.tsv. Without it there is no way to match head columns to bank genes.")
+    g = pd.read_csv(p, sep="\t")
+    if "global_gene_index" in g.columns:
+        g = g.sort_values("global_gene_index")
+        gid = g["global_gene_index"].astype(np.int64).to_numpy()
+    else:
+        gid = np.arange(len(g), dtype=np.int64)
+    if len(gid) != n_genes:
+        raise SystemExit(f"gene table has {len(gid)} genes but the head emits {n_genes}.")
+    return gid
 
 
 class TileDS(Dataset):
@@ -108,6 +136,16 @@ def main():
     w.add_argument("--stage2", default=None, help="Stage-2 weights, .safetensors or .pt")
     w.add_argument("--genes", default=None, help="TSV of the head's gene symbols; taken from --release if absent")
 
+    st3 = ap.add_argument_group("stage 3 (optional): retrieval and the per-gene gate")
+    st3.add_argument("--bank", default=None,
+                     help="a retrieval bank directory from predict/build_bank.py. Must be the same tissue, must "
+                          "NOT contain this slide, and must be embedded with these weights.")
+    st3.add_argument("--gate", default=None,
+                     help="a gate JSON from benchmark/fit_gate.py (global gene id -> beta). Without it, --bank "
+                          "still reports the retrieval branch but X stays the direct branch.")
+    st3.add_argument("--knn", type=int, default=200, help="neighbours retrieved per cell")
+    st3.add_argument("--tau", type=float, default=0.03, help="softmax temperature on cosine similarity")
+
     o = ap.add_argument_group("output")
     o.add_argument("--out", required=True, help="output .h5ad")
     o.add_argument("--save_embeddings", action="store_true",
@@ -120,6 +158,7 @@ def main():
 
     want_emb = a.save_embeddings or a.embeddings_only
     want_genes = not a.embeddings_only
+    need_emb = want_emb or bool(a.bank)          # retrieval queries the bank with the same pooled feature
 
     if a.release or (a.stage1 and a.stage2):
         s1, s2 = a.stage1, a.stage2
@@ -148,8 +187,35 @@ def main():
     tiles = tile(source.pos, a.tile)
     print(f"[run]   {len(source):,} cells in {len(tiles):,} tiles of {a.tile} px", flush=True)
     t0 = time.time()
-    pred, emb = run(model, se2, source, tiles, n_genes, a.workers, dev, want_genes, want_emb)
+    pred, emb = run(model, se2, source, tiles, n_genes, a.workers, dev, want_genes, need_emb)
+    emb_for_R = emb
     print(f"[run]   done in {time.time()-t0:.0f}s", flush=True)
+
+    # ---- Stage 3: retrieval branch, then the per-gene gate ----
+    R = beta = None
+    if a.bank and want_genes:
+        from voice.retrieval import crossR
+        from predict.build_bank import weights_id
+        gid = panel_global_ids(a.release, a.genes, n_genes)
+        t1 = time.time()
+        R_head, _cov = crossR(emb_for_R, gid, a.bank, K=a.knn, tau=a.tau,
+                              weights_id=weights_id(a.release, s1, s2), device=a.device)
+        print(f"[R]     retrieval done in {time.time()-t1:.0f}s", flush=True)
+        R = R_head
+        if a.gate:
+            import json
+            from voice.gate import apply_gate
+            gb = {int(k): float(v) for k, v in json.load(open(a.gate)).items()}
+            fused, beta = apply_gate(pred, R, gid, gb)
+            n_fused = int((beta < 1.0).sum())
+            print(f"[gate]  fused {n_fused}/{n_genes} genes (the rest keep the direct branch: no retrieval "
+                  f"coverage, or the gate has no entry)", flush=True)
+            pred, direct = fused, pred
+        else:
+            direct = None
+            print("[gate]  no --gate: X stays the direct branch; the retrieval arm is in layers['R']", flush=True)
+    else:
+        direct = None
 
     import anndata as ad, pandas as pd
     from voice.release import gene_names
@@ -175,9 +241,18 @@ def main():
     A.obsm["spatial"] = source.pos[:, ::-1].copy()          # (x, y), the scanpy convention
     if want_emb:
         A.obsm["X_voice"] = emb
+    if R is not None:
+        A.layers["R"] = R
+        if direct is not None:
+            A.layers["A"] = direct
+        if beta is not None:
+            A.var["beta"] = beta
     A.uns["voice"] = dict(model=name, source=source.kind, crop_px=float(source.crop_px),
                           mpp=float(source.mpp) if source.mpp else None, tile=int(a.tile),
-                          layer="log1p(mu), direct branch only (no retrieval, no Stage-3 gate)",
+                          layer=("log1p(mu), Stage-3 fused (beta*A + (1-beta)*R)" if beta is not None
+                                 else "log1p(mu), direct branch only"),
+                          bank=a.bank, gate=a.gate, knn=int(a.knn) if a.bank else None,
+                          tau=float(a.tau) if a.bank else None,
                           embedding="obsm['X_voice'] = 1536-d cell feature" if want_emb else None)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     A.write_h5ad(a.out)

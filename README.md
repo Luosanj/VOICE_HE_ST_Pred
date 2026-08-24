@@ -6,7 +6,7 @@ VOICE is a three-stage model. **Stage 1** adapts a pathology foundation encoder 
 each cell's image to a single-cell expression embedding by contrastive learning. **Stage 2** decodes that
 representation with an SE(2)-equivariant transformer over the cell's spatial neighbourhood and a
 negative-binomial head, giving expression for a 6,029-gene panel. **Stage 3** fuses this direct prediction with a
-retrieval prediction using a per-gene weight fitted on reference slides.
+retrieval prediction using a per-gene weight fitted on reference slides and transferred to the target.
 
 This repository contains the training code, an inference entry point for your own H&E, and the benchmark code.
 
@@ -78,11 +78,39 @@ the boundary decides which image evidence is attributed to this cell rather than
 polygons the mask falls back to the centre token, which works but is measurably worse. If you have
 segmentations from your own pipeline, write them into `cells.npz` and skip `segment.py`.
 
-### What `predict.py` does not do
+### Stage 3: retrieval and the per-gene gate
 
-It runs the direct branch (Stages 1–2) only. The retrieval branch and the Stage-3 gate need a reference bank of
-millions of embedded cells from the same tissue, which cannot ship with the code; `benchmark/` shows how to
-build one from your own reference slides.
+The direct branch predicts from the image alone. The retrieval branch asks a different question — which cells
+in a reference cohort look like this one, and what were they expressing — and averages their measured profiles.
+The gate fuses them per gene, `pred_g = beta_g * A_g + (1 - beta_g) * R_g`.
+
+Stage 3 needs reference slides **of the same tissue that have measured expression**, so it is optional: a slide
+with no reference cohort still gets the direct branch.
+
+```bash
+# 1. embed the reference slides into a bank
+python predict/build_bank.py --release weights/voice-23m --bank_dir bank/lung \
+    --global_genes weights/voice-23m/genes.tsv --prepared /data/ref/lung_a /data/ref/lung_b
+
+# 2. fit the gate on those references (each is retrieved from a bank that EXCLUDES itself)
+python benchmark/fit_gate.py --release weights/voice-23m --bank bank/lung \
+    --prepared /data/ref/lung_a /data/ref/lung_b --out gate_lung.json
+
+# 3. predict with both
+python predict/predict.py --prepared /data/slides/target --release weights/voice-23m \
+    --bank bank/lung --gate gate_lung.json --out pred.h5ad
+```
+
+The output then carries `layers["A"]` (direct), `layers["R"]` (retrieval, NaN where no reference measures the
+gene), `var["beta"]`, and `X` = the fusion.
+
+Two rules the code enforces rather than trusts you to remember. The bank must **not contain the target** —
+retrieving a slide from a bank that includes it finds the cell itself and reports its own label. And the bank
+must be embedded with the **same weights** as the query, or query and bank sit in different spaces and the
+neighbours mean nothing; the encoder identity is stored in each bank file and checked.
+
+Where beta is fitted is the whole point: fitting it on the target needs the labels being predicted, which is an
+oracle, not a method. `benchmark/fit_gate.py` fits on references and transfers.
 
 ## Train
 
@@ -136,9 +164,11 @@ stay comparable.
 ## Repository layout
 
 ```
-voice/           the package: encoder + LoRA, SE(2) decoder, NB head, gene space, IO
+voice/           the package: encoder + LoRA, SE(2) decoder, NB head, retrieval, gate, gene space, IO
   paths.py       every environment-dependent path, resolved from env vars or configs/default.yaml
-  encoder.py     UNI2-h + LoRA + cell-mask pooling  (the only thing inference needs)
+  encoder.py     UNI2-h + LoRA + cell-mask pooling  (the only thing the direct branch needs)
+  retrieval.py   the bank, exact top-K, per-gene-signature cross-slide retrieval
+  gate.py        the per-gene fusion weight: fitting, transferring, and the oracle upper bound
 predict/         segment -> crop -> predict; inputs.py holds the two slide layouts
 weights/         released weights go here (git-ignored; see weights/README.md)
 train/           Phase 1 and Phase 2, with the shipped hyper-parameters
