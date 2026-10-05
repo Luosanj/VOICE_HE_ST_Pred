@@ -54,6 +54,33 @@ python -m experiments.ablation.retrieval_alignment --slides retrieval_slides.yam
 
 Repeat extraction for Stage 1 using separate bank/query paths. Evaluation YAML: `slides` list with `name`, optional `exclude`, and `variants` mapping labels to `query` and `bank` paths. It verifies matching reference-slide names, query cells, expression, and genes, then scores genes covered by every variant. Defaults: K=200, tau=0.03.
 
+## No-Stage-1 training
+
+Use your own prepared training cache and offline UNI2-h cache. No bank construction, scFoundation embeddings, or Stage-1 checkpoint is required. Set `VOICE_HF_HOME`, `VOICE_V2_ROOT`, and a separate `VOICE_CKPT_DIR` for this run:
+
+```bash
+export VOICE_HF_HOME=/models/hf_cache
+export VOICE_V2_ROOT=/data/training_cache
+export VOICE_CKPT_DIR=/models/nostage1
+NPROC=1 bash train/run_nostage1.sh
+```
+
+This calls the existing Stage-2 trainer with `--lora_ckpt none`, empty `init_from`, two epochs, no validation split, and the five in-slide benchmark slides excluded. UNI2-h base weights stay frozen; freshly initialized LoRA and SE(2) are trained together (not a frozen-encoder ablation). Defaults match the ablation: last 12 encoder blocks, r=16, alpha=32, dropout=0.05, freeze_frac=0.2, d_model=512, six spatial layers, lr_lora=3e-5, lr_se2=1e-4. The first three adapted blocks remain frozen with zero-B adapters. `NPROC` is the number of GPUs; one is the default. Use the same `NPROC` as the comparison run to match optimizer-step counts.
+
+Required cache files: `manifest_v2.csv` (`sample`, boolean `in_training`), `global_genes_v2.tsv` (`gene_symbol`, `global_gene_index`), `crops_raw/<slide>/crops.u8`, `crops_raw/<slide>/maskW.f16`, and `sample_meta/<slide>/{expression.npz,genes.tsv,patch_cell_boundaries.npz}`. Crop/mask files are NumPy-format arrays without a `.npy` suffix, aligned with expression and boundary rows; shapes and mask normalization follow the main training README. Stage-1-only `cell_emb_scf` inputs are not needed. For your own held-out set, use `EXCL_INSLIDE=0 EXCLUDE_SLIDES=heldout.txt`; `SLIDES=train.txt` selects exact training slides.
+
+Output: `VOICE_CKPT_DIR/se2_lora_abl_nos1_{latest,epoch*,final}.pt`. Change `TAG` to separate runs. Resume only from the same no-Stage-1 run; checkpoints retain training arguments and decoder/LoRA states (latest also stores optimizer and RNG states).
+
+The existing prediction entry accepts these weights via `--stage1 none --stage2 /models/nostage1/se2_lora_abl_nos1_final.pt`. Supply your already prepared bank and beta/gate paths as usual; this entry does not build or modify them:
+
+```bash
+python predict/predict.py --prepared /data/target --stage1 none \
+  --stage2 /models/nostage1/se2_lora_abl_nos1_final.pt --genes /data/training_cache/global_genes_v2.tsv \
+  --bank /data/nostage1_bank --gate /data/nostage1_gate.json --out /results/nostage1.h5ad --save_embeddings
+```
+
+Query features and reference-bank features must use the same encoder. Omit `--bank` and `--gate` for direct-only prediction.
+
 ## Fusion methods
 
 A gate-comparison YAML maps slide keys to `predictions` and `gene_list` paths. NPZ arrays: `Apred`, `Rr`, `Ylog`, `band`, and `genes`. Both branches must already be out of fold. Optional `transfers` entries contain `source: [slide_keys]` and `target: slide_key`.

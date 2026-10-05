@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the spatial expression decoder with spatial validation. Input: prepared crops, masks, positions, gene panels, counts, and Stage-1 weights. Output: Stage-2 checkpoints."""
+"""Train Stage 2 from prepared inputs; --lora_ckpt none skips Stage 1. Output: Stage-2 checkpoints."""
 from __future__ import annotations
 import sys, os, pathlib, time, math, argparse
 from datetime import timedelta
@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, Subset
 from scipy import sparse
 from PIL import Image, ImageDraw
-from voice.clip_lora import build_uni2, inject_lora, pooled_feat, trainable, MEAN, STD, EXCL
+from voice.encoder import build_uni2, inject_lora, pooled_feat, MEAN, STD
 from voice.scale_train import ScaleHE2Cell, nb_nll
 
 V2 = _p.v2_root(); SM = f"{V2}/sample_meta"; CROPS = f"{V2}/crops_raw"; CKDIR = _p.ckpt_dir()
@@ -20,6 +20,29 @@ LORA_CKPT = f"{V2}/ckpts/clip_lora_v2_final.pt"
 GLOBAL_GENES = f"{V2}/global_genes_v2.tsv"; MANIFEST = f"{V2}/manifest_v2.csv"
 AMP = torch.bfloat16
 _HDR = {"gene", "gene_symbol", "symbol", "genes", "name"}
+# Same benchmark exclusions as Stage 1, without importing its scFoundation inputs.
+EXCL = {
+    "breast_cancer_sample1_xenium_replicate_1_Xenium_FFPE_Human_Breast_Cancer_Rep1",
+    "breast_cancer_sample1_xenium_replicate_2_Xenium_FFPE_Human_Breast_Cancer_Rep2",
+    "breast_cancer_sample2_xenium_Xenium_V1_FFPE_Preview_Human_Breast_Cancer_Sample_2",
+    "lung_cancer_sample1_xenium_Xenium_V1_humanLung_Cancer_FFPE",
+    "skin_melanoma_sample1_xenium_Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE",
+}
+
+
+def trainable(model):
+    return {n: p for n, p in model.named_parameters() if p.requires_grad}
+
+
+def load_initial_lora(model, checkpoint, dev):
+    """Keep fresh zero-B adapters for no-Stage-1, otherwise load the contrastive adapters."""
+    msd = dict(model.named_parameters())
+    if str(checkpoint).strip().lower() != "none":
+        lck = torch.load(checkpoint, map_location=dev, weights_only=False)
+        miss = [n for n in lck["lora"] if n not in msd]
+        assert not miss, f"warm-start LoRA keys absent in model: {miss[:4]}"
+        for n, v in lck["lora"].items(): msd[n].data.copy_(v.to(dev))
+    return msd
 
 
 def read_genes(path):
@@ -211,8 +234,9 @@ def main():
     ap.add_argument("--warmup_frac", type=float, default=0.05); ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--const_lr", type=float, default=0.0, help="if >0, flat lr = const_lr*base (no-spike extension)")
     ap.add_argument("--workers", type=int, default=6); ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--lora_ckpt", default=LORA_CKPT); ap.add_argument("--max_slides", type=int, default=0)
-    ap.add_argument("--exclude_inslide", action="store_true", help="also hold out the 5 in-slide benchmark slices (clip_lora.EXCL)")
+    ap.add_argument("--lora_ckpt", default=LORA_CKPT, help="Stage-1 checkpoint, or 'none' to start from UNI2-h")
+    ap.add_argument("--max_slides", type=int, default=0)
+    ap.add_argument("--exclude_inslide", action="store_true", help="also hold out the 5 in-slide benchmark slices")
     ap.add_argument("--init_from", default="", help="warm-start TRAINED lora+se2 from a Phase-2 ckpt (fresh epoch counter/opt)")
     ap.add_argument("--max_steps", type=int, default=0)
     ap.add_argument("--slides", default="", help="text file, one slide per line: train on exactly these slides "
@@ -233,6 +257,11 @@ def main():
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--check_only", action="store_true")
     args = ap.parse_args()
+    no_stage1 = args.lora_ckpt.strip().lower() == "none"
+    if no_stage1:
+        args.lora_ckpt = "none"
+        if args.init_from:
+            ap.error("--lora_ckpt none requires an empty --init_from (no Stage-2 warm-start)")
     if args.smoke:
         args.epochs, args.save_every, args.workers, args.max_cells, args.max_slides, args.max_steps = 1, 4, 2, 32, 2, 8
         args.val_every, args.val_max_patches, args.val_workers = 4, 8, 0
@@ -289,11 +318,7 @@ def main():
     for p in model.parameters(): p.requires_grad = False
     for n, p in model.named_parameters():
         if ".A" in n or ".B" in n: p.requires_grad = True
-    lck = torch.load(args.lora_ckpt, map_location=dev, weights_only=False)
-    msd = dict(model.named_parameters())
-    miss = [n for n in lck["lora"] if n not in msd]
-    assert not miss, f"warm-start LoRA keys absent in model: {miss[:4]}"
-    for n, v in lck["lora"].items(): msd[n].data.copy_(v.to(dev))
+    msd = load_initial_lora(model, args.lora_ckpt, dev)
     nfz, _ = freeze_first_lora(model, args.nblocks, args.freeze_frac)
     model.set_grad_checkpointing(True)
     se2 = ScaleHE2Cell(n_global, feat_dim=1536, d_model=args.d_model, n_layers=args.n_layers).to(dev)
@@ -344,6 +369,10 @@ def main():
     step, ep0, saved_ep, best_val = 0, 0, 0, float("inf")
     if args.resume and os.path.exists(latest):
         ck = torch.load(latest, map_location=dev, weights_only=False)
+        if no_stage1:
+            previous = ck.get("args", {})
+            if str(previous.get("lora_ckpt", "")).strip().lower() != "none" or previous.get("init_from"):
+                raise ValueError("no-Stage-1 resume requires a no-Stage-1 checkpoint; use a separate --tag/output directory")
         for n, v in ck["lora"].items(): msd[n].data.copy_(v.to(dev))
         se2.load_state_dict(ck["se2"]); opt.load_state_dict(ck["opt"])
         torch.set_rng_state(ck["torch_rng"].cpu() if torch.is_tensor(ck["torch_rng"]) else ck["torch_rng"])

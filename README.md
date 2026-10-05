@@ -76,6 +76,8 @@ python experiments/benchmark/eval_inslide.py --slides slides.yaml --global_genes
 
 Stage 1 writes `VOICE_V2_ROOT/ckpts/clip_lora_<tag>_*`; Stage 2 writes `VOICE_CKPT_DIR/se2_lora_<tag>_*`. Set `NPROC`, `TAG`, and other script variables for your run. Evaluation writes all-gene and HVG/SVG PCC tables. In-slide evaluation uses spatial five-fold fitting; cross-slide evaluation applies fixed weights.
 
+No-Stage-1 ablation: `bash train/run_nostage1.sh` trains directly from UNI2-h using your prepared cache, without Stage-1 weights or a Stage-2 warm-start. See [inputs and usage](experiments/README.md#no-stage-1-training).
+
 Evaluation, ablation, and downstream inputs, commands, and outputs: [experiments/README.md](experiments/README.md).
 
 ## Citation

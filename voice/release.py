@@ -1,4 +1,4 @@
-"""Load trained model weights. Input: release directory or Stage-1/Stage-2 checkpoints. Output: encoder, spatial decoder, and model configuration."""
+"""Load model weights; stage1='none' uses UNI2-h plus a no-Stage-1 Stage-2 checkpoint."""
 from __future__ import annotations
 import os, json
 import torch
@@ -36,13 +36,14 @@ def load_release(where, device="cuda", stage1=None, stage2=None):
         stage1 = stage1 or os.path.join(where, "stage1.safetensors")
         stage2 = stage2 or os.path.join(where, "stage2.safetensors")
     if not (stage1 and stage2):
-        raise ValueError("give a release directory, or both --stage1 and --stage2")
-    for f in (stage1, stage2):
+        raise ValueError("give a release directory, or --stage1 (path or 'none') and --stage2")
+    no_stage1 = str(stage1).strip().lower() == "none"
+    for f in ([stage2] if no_stage1 else [stage1, stage2]):
         if not os.path.exists(f):
             raise FileNotFoundError(f)
 
     dev = torch.device(device)
-    w1 = read_weights(stage1, "cpu")
+    w1 = {"lora": {}} if no_stage1 else read_weights(stage1, "cpu")
     w2 = read_weights(stage2, "cpu")
 
 
