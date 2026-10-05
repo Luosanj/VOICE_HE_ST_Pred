@@ -215,6 +215,10 @@ def main():
     ap.add_argument("--exclude_inslide", action="store_true", help="also hold out the 5 in-slide benchmark slices (clip_lora.EXCL)")
     ap.add_argument("--init_from", default="", help="warm-start TRAINED lora+se2 from a Phase-2 ckpt (fresh epoch counter/opt)")
     ap.add_argument("--max_steps", type=int, default=0)
+    ap.add_argument("--slides", default="", help="text file, one slide per line: train on exactly these slides "
+                                                 "instead of the manifest's in_training set")
+    ap.add_argument("--exclude_slides", default="", help="text file, one slide per line: held-out slides removed "
+                                                         "from the training set (e.g. donor-held-out calibration slides)")
 
     ap.add_argument("--val_frac", type=float, default=0.1,
                     help="per-slide spatial band held out for validation (0 = no val, == old se2_lora_v2 behaviour)")
@@ -247,6 +251,16 @@ def main():
 
     sym2glob, n_global = sym2glob_map()
     mf = pd.read_csv(MANIFEST); samples = list(mf[mf.in_training]["sample"])
+    _list = lambda f: [l.strip() for l in open(f) if l.strip() and not l.startswith("#")]
+    if args.slides:
+        samples = _list(args.slides)
+        unknown = sorted(set(samples) - set(mf["sample"]))
+        assert not unknown, f"--slides lists slides absent from {MANIFEST}: {unknown[:5]}"
+        if r0: print(f"[slides] {len(samples)} training slides from {args.slides}", flush=True)
+    if args.exclude_slides:
+        held = set(_list(args.exclude_slides)); n0 = len(samples); samples = [s for s in samples if s not in held]
+        if r0: print(f"[exclude_slides] held out {n0-len(samples)} slides listed in {args.exclude_slides} "
+                     f"-> {len(samples)} train slides", flush=True)
     if args.exclude_inslide:
         n0 = len(samples); samples = [s for s in samples if s not in EXCL]
         if r0: print(f"[exclude_inslide] held out {n0-len(samples)} in-slide benchmark slices -> {len(samples)} train slides", flush=True)

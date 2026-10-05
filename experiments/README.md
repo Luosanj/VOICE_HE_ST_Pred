@@ -13,6 +13,8 @@ Run entries from the repository root with `python -m`. Supply your own data, mod
 | `ablation.gate_methods` | Spatial out-of-fold branch predictions, band IDs, canonical gene lists | Grid/MLP PCC tables |
 | `ablation.cache_references` | Model weights, same-tissue prepared slides, excluding banks | Reference A/R/Y NPZ caches |
 | `ablation.beta_stability` | Reference caches and original target branch caches | Beta support, SD, pair correlations, pooled/global comparisons |
+| `ablation.donor_split` | Training slides with donor labels, target slides, head gene table | Donor-grouped train/held-out split and Stage-2 slide lists |
+| `ablation.donor_calibration` | Split, reference caches and target predictions for an all-slide and a held-out Stage 2 | Gate PCC tables (in-sample vs held-out references), gate and reference-slide statistics |
 | `ablation.mask_sensitivity` | Prepared target, fixed weights/bank/gate, canonical genes | 13 mask conditions, A/R/fused predictions, PCC and mask statistics |
 | `downstream.pancreas` | Paired expression/predictions, frozen domains, Reactome GMT | Domain agreement, shared DEGs, gene/pathway block correlations |
 | `downstream.proliferation` | Paired breast data and official subtype labels | Six-gene G2/M AUROC and score PCC |
@@ -67,6 +69,36 @@ python -m experiments.ablation.beta_stability --references reference_cache \
 Reference YAML: `slides` list with `name`, `tissue`, `dir`, `bank`, and optional `exclude` names. Beta analysis selects up to four reference caches per tissue by cell count. `--targets` supplies a JSON mapping cache stems to `[tissue, per-gene TSV]`. Optional `--exclude`, `--duplicates`, and `--specimen_pairs` supply reference exclusions and paired-specimen groups.
 
 Target cache layout: `Across_<stem>.npz` (`Apred`, `Ylog`, `gid`), `Rcross_<stem>__full.npz` (`R`, `panel`, `covered`), and `pergene_pcc/<stem>.tsv` with `gene`, `global_id`, `hvg_rank`, `svg_rank`, `pcc_A`, `pcc_STACK`, and `beta`.
+
+## Donor-held-out gate calibration
+
+Compares fusion weights fitted on Stage-2 training slides with weights fitted on held-out donors. Arms: (a) Stage 2 on all slides, weights from its training slides; (b) Stage 2 without the held-out donors, weights from its remaining same-tissue slides; (c) the same model, weights from the held-out donors.
+
+```bash
+python -m experiments.ablation.donor_split --slides train_slides.csv --targets targets.csv \
+  --global_genes genes.tsv --val_frac 0.4 --out split
+SLIDES=split/stage2_slides.txt EPOCHS=1 VAL_FRAC=0 TAG=heldout bash train/run_phase2.sh
+python -m experiments.ablation.donor_calibration --config calibration.yaml --out results/calibration
+```
+
+`train_slides.csv`: `slide`, `dir`, `donor`, `tissue` for every Stage-2 training slide (`tissue` empty outside the evaluation tissues; slides of one specimen share a `donor`). `targets.csv`: `tissue`, `dir`. The split keeps the union of trained genes unchanged, never splits a donor, then maximizes same-tissue target-gene coverage of both parts and matches `--val_frac` by slides, then cells. Outputs: `split.json`, `stage2_slides.txt`, `heldout_slides.txt`. `train/run_phase2.sh` also accepts `EXCLUDE_SLIDES=split/heldout_slides.txt`.
+
+For each Stage-2 model, supply reference caches (`ablation.cache_references`, one per reference bank exclusion) and target predictions from that model's weights and banks. Calibration YAML:
+
+```yaml
+split: split/split.json
+targets:
+  lung: {dir: /data/lung_target, gene_list: gene_lists/lung_target.tsv}
+models:
+  all_slides:
+    predictions: {lung: pred/all/lung.h5ad}
+    references: {slide_out: cache/all_slide_out, donor_out: cache/all_donor_out}
+  held_out:
+    predictions: {lung: pred/heldout/lung.h5ad}
+    references: {slide_out: cache/heldout_slide_out, donor_out: cache/heldout_donor_out}
+```
+
+`slide_out` caches exclude only the reference slide from its bank; `donor_out` caches also exclude the other slides of its donor. Predictions are `predict.py --bank` outputs without `--gate` (`X` direct, `layers['R']` retrieval), or NPZs with `A`, `R`, `gid`, `Ylog` over the gene list. Each reference gets 41-point grid weights on covered target-panel genes; beta is their mean over a reference set (`largest4`, `all`, `train`, `val`); genes without beta keep the direct branch. Outputs: `results.tsv` (7 PCC metrics, gated genes, mean beta, references per gene, SD across references), `references.tsv` (direct, retrieval and best-mix PCC per reference slide), `pergene.tsv.gz`, and `summary.md`, with direct, retrieval, fixed 0.5 and target-fitted oracle rows.
 
 ## Mask sensitivity
 

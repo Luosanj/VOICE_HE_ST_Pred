@@ -31,11 +31,15 @@ VAL_FRAC=${VAL_FRAC:-0.1}
 VAL_MARGIN=${VAL_MARGIN:-256}
 VAL_EVERY=${VAL_EVERY:-2000}
 VAL_PATCHES=${VAL_PATCHES:-400}
+SLIDES=${SLIDES:-}                  # optional: file listing the exact training slides
+EXCLUDE_SLIDES=${EXCLUDE_SLIDES:-}  # optional: file listing held-out slides (donor-held-out calibration)
 EXTRA=${EXTRA:-}
 
 LOG=$SF/logs/phase2_${TAG}.log; mkdir -p "$SF/logs"
 [ "$EXCL_INSLIDE" = "1" ] && EXTRA="$EXTRA --exclude_inslide"
 [ -n "$INIT_FROM" ] && EXTRA="$EXTRA --init_from $INIT_FROM"
+[ -n "$SLIDES" ] && EXTRA="$EXTRA --slides $SLIDES"
+[ -n "$EXCLUDE_SLIDES" ] && EXTRA="$EXTRA --exclude_slides $EXCLUDE_SLIDES"
 
 echo "===== $(date) | TAG=$TAG NPROC=$NPROC EPOCHS=$EPOCHS CONST_LR=$CONST_LR VAL_FRAC=$VAL_FRAC =====" | tee -a "$LOG"
 cd "$SF"
