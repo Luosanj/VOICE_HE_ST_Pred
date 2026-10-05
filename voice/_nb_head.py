@@ -1,23 +1,4 @@
-"""[VOICE] Negative-binomial output head.
-
-Contributed by Yicheng Tao as part of the VOICE work; vendored here so the repository is
-self-contained. Behaviour is unchanged from the original.
-"""
-"""he2cell + two upgrades, both optional and composable:
-
-  MoE head  -- a mixture of linear gene predictors. A gate over the SE(2)-refined
-               embedding mixes E experts; with cell-type labels the gate is
-               supervised (CE) so experts specialise per cell type. Experts can be
-               warm-started from the per-cell-type average expression profile.
-
-  RAG       -- retrieval-augmented prediction. A frozen memory bank of TRAIN cells
-               (UNI feature -> log1p expression) is queried with each cell's UNI
-               feature; the K nearest neighbours' expression is pooled and fused
-               into the prediction through a learned per-cell gate (gene-space
-               residual toward retrieval). Self is masked out during training.
-
-Baseline (use_moe=False, use_rag=False) == SimpleHE2Cell.
-"""
+"""Predict gene expression. Input: cell representations. Output: log1p count means and negative-binomial parameters."""
 
 import math
 from typing import Optional
@@ -38,7 +19,7 @@ class MoEHead(nn.Module):
         self.n_genes = n_genes
         self.trunk = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model), nn.GELU())
         self.gate = nn.Linear(d_model, n_experts)
-        # one [d_model -> n_genes] expert stacked into a single matmul: [E, d, G]
+
         self.expert_w = nn.Parameter(torch.empty(n_experts, d_model, n_genes))
         self.expert_b = nn.Parameter(torch.zeros(n_experts, n_genes))
         nn.init.xavier_uniform_(self.expert_w)
@@ -50,12 +31,12 @@ class MoEHead(nn.Module):
                 self.expert_b.copy_(avg_log)
 
     def forward(self, h: torch.Tensor):
-        t = self.trunk(h)                                   # [N, d]
-        gate_logits = self.gate(t)                          # [N, E]
-        g = torch.softmax(gate_logits, dim=-1)              # [N, E]
-        # expert outputs: [N, E, G]
+        t = self.trunk(h)
+        gate_logits = self.gate(t)
+        g = torch.softmax(gate_logits, dim=-1)
+
         eo = torch.einsum("nd,edg->neg", t, self.expert_w) + self.expert_b
-        pred = (g.unsqueeze(-1) * eo).sum(1)                # [N, G]
+        pred = (g.unsqueeze(-1) * eo).sum(1)
         return pred, {"gate_logits": gate_logits}
 
 
@@ -72,19 +53,15 @@ class LinearHead(nn.Module):
 
 
 class NBHead(nn.Module):
-    """Negative-binomial count head. Predicts the count mean mu; the canonical
-    prediction is log1p(mu). Trained with NB-NLL on RAW counts FUSED with the
-    log1p-MSE (NB gives a better-calibrated gradient for overdispersed / sparse
-    counts; MSE keeps it aligned with the log-space eval metric)."""
 
     def __init__(self, d_model: int, n_genes: int):
         super().__init__()
         self.trunk = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model), nn.GELU())
         self.mu_lin = nn.Linear(d_model, n_genes)
-        self.log_theta = nn.Parameter(torch.zeros(n_genes))  # per-gene dispersion
+        self.log_theta = nn.Parameter(torch.zeros(n_genes))
 
     def forward(self, h):
-        mu = F.softplus(self.mu_lin(self.trunk(h))) + 1e-4   # [N,G] raw count mean
+        mu = F.softplus(self.mu_lin(self.trunk(h))) + 1e-4
         return torch.log1p(mu), {"mu": mu, "log_theta": self.log_theta}
 
 
@@ -97,14 +74,13 @@ class RAGFusion(nn.Module):
         self.gate = nn.Sequential(
             nn.Linear(d_model + 2, d_model), nn.GELU(), nn.Linear(d_model, out)
         )
-        # start at beta~0.5: retrieval is a strong prior (kNN alone ~= GHIST), so
-        # the model should be free to lean on it from the start and learn the
-        # cell-specific residual the base predictor adds.
+
+
         nn.init.zeros_(self.gate[-1].weight)
         nn.init.constant_(self.gate[-1].bias, 0.0)
 
     def forward(self, base_pred, h, retrieved, sim_stats):
-        beta = torch.sigmoid(self.gate(torch.cat([h, sim_stats], dim=-1)))  # [N,1] or [N,G]
+        beta = torch.sigmoid(self.gate(torch.cat([h, sim_stats], dim=-1)))
         return base_pred + beta * (retrieved - base_pred), beta
 
 
@@ -136,7 +112,7 @@ class HE2CellPlus(nn.Module):
         self.use_rag = use_rag
         self.rag_k = rag_k
         self.rag_temp = rag_temp
-        self.rag_mode = rag_mode  # "gate" (gene-space gated blend) | "input" (retrieval as head feature)
+        self.rag_mode = rag_mode
         if use_moe:
             self.head = MoEHead(d_model, n_genes, n_experts)
         elif head_type == "nb":
@@ -145,16 +121,16 @@ class HE2CellPlus(nn.Module):
             self.head = LinearHead(d_model, n_genes)
         self.rag = RAGFusion(d_model, n_genes, per_gene_gate) if (use_rag and rag_mode == "gate") else None
         if use_rag and rag_mode == "input":
-            # project retrieved log1p expression into model space; zero-init so the
-            # model starts == base and learns to USE retrieval only if it helps.
+
+
             self.retr_in = nn.Linear(n_genes, d_model)
             nn.init.zeros_(self.retr_in.weight)
             nn.init.zeros_(self.retr_in.bias)
 
-        # memory bank (registered as buffers so .to(device) moves them; set via set_bank)
+
         self.register_buffer("bank_feats", torch.zeros(0), persistent=False)
         self.register_buffer("bank_expr", torch.zeros(0), persistent=False)
-        self._id2pos = None  # dict cell_id -> bank row
+        self._id2pos = None
 
     @torch.no_grad()
     def set_bank(self, feats: torch.Tensor, expr_log: torch.Tensor, ids):
@@ -166,10 +142,10 @@ class HE2CellPlus(nn.Module):
 
     @torch.no_grad()
     def _retrieve(self, uni_feats: torch.Tensor, query_ids=None):
-        q = F.normalize(uni_feats.float(), dim=1)            # [N,1024]
-        sim = q @ self.bank_feats.T                          # [N,M]
+        q = F.normalize(uni_feats.float(), dim=1)
+        sim = q @ self.bank_feats.T
         if self.training and query_ids is not None and self._id2pos is not None:
-            # mask self-match so a train cell can't retrieve its own expression
+
             rows, cols = [], []
             for r, cid in enumerate(query_ids):
                 p = self._id2pos.get(int(cid), -1)
@@ -177,16 +153,16 @@ class HE2CellPlus(nn.Module):
                     rows.append(r); cols.append(p)
             if rows:
                 sim[torch.tensor(rows, device=sim.device), torch.tensor(cols, device=sim.device)] = -1e4
-        topv, topi = sim.topk(self.rag_k, dim=1)             # [N,K]
-        neigh = self.bank_expr[topi]                         # [N,K,G]
-        w = torch.softmax(topv / self.rag_temp, dim=1).unsqueeze(-1)  # [N,K,1]
-        retrieved = (w * neigh).sum(1)                       # [N,G]
-        sim_stats = torch.stack([topv.mean(1), topv[:, 0]], dim=1)    # [N,2]
+        topv, topi = sim.topk(self.rag_k, dim=1)
+        neigh = self.bank_expr[topi]
+        w = torch.softmax(topv / self.rag_temp, dim=1).unsqueeze(-1)
+        retrieved = (w * neigh).sum(1)
+        sim_stats = torch.stack([topv.mean(1), topv[:, 0]], dim=1)
         return retrieved, sim_stats
 
     def forward(self, features, pos, query_ids=None):
-        x = self.encoder(features)                           # [N,d]
-        h = self.se2(x, pos)                                 # [N,d]
+        x = self.encoder(features)
+        h = self.se2(x, pos)
         base_pred, head_aux = self.head(h)
         gate_logits = head_aux.get("gate_logits")
         beta = None

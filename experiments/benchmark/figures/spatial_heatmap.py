@@ -1,22 +1,8 @@
 #!/usr/bin/env python
-"""Spatial heat maps: measured versus predicted expression of one gene, cell by cell.
-
-    python benchmark/figures/spatial_heatmap.py --preds preds/my_slide.npz --gene ACTA2 --out fig.png
-
-Reads a prediction file written by `benchmark/eval_crossslide.py --save_preds`.
-
-Expression is shown as a **within-panel z-score**: each cell's value for the gene is standardised against that
-gene's distribution over the slide, so measured counts and predicted log1p(mu) -- which live on different scales
--- can share a colour bar and be compared by eye. Colour limits are the same for both panels, taken from a
-robust percentile range of the two together, so a difference in the picture is a difference in the prediction
-and not in the scaling.
-
-Cells are drawn as points at their centroids. `--zoom x0,y0,x1,y1` adds an inset over a region, matching the
-enlarged panels in the paper's figures.
-"""
+"""Plot measured and predicted gene expression. Input: prediction NPZ, gene name, and optional region. Output: spatial heatmap image."""
 from __future__ import annotations
 import os, sys, argparse, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent.parent))
 import numpy as np
 
 

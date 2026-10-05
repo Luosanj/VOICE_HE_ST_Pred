@@ -1,14 +1,4 @@
-"""Reading a whole-slide image, and getting per-cell crops out of it.
-
-Three readers are tried in order -- OpenSlide (SVS/NDPI/MRXS/pyramidal TIFF), tifffile (OME-TIFF, plain TIFF),
-then Pillow (PNG/JPEG, and small TIFFs). Each is imported lazily so that a user who only has PNGs never needs
-OpenSlide installed, and a user who has SVS gets a message naming the package instead of a decode error.
-
-`SlideReader.crops()` returns crops already resized to the encoder's input size, so the caller never has to know
-the source resolution: it passes the crop side in SOURCE pixels (from `geometry.crop_px_for(mpp)`) and gets back
-uint8 [n, 3, 224, 224]. Cells whose crop would fall outside the image are zero-padded rather than dropped, so the
-output row order always matches the input cell order.
-"""
+"""Read slide images and extract crops. Input: TIFF, SVS, NDPI, or raster images. Output: image dimensions, resolution, and RGB crops."""
 from __future__ import annotations
 import numpy as np
 

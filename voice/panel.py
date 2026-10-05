@@ -1,22 +1,4 @@
-"""What counts as a gene, and how a slide's panel maps onto the model's output head.
-
-A Xenium/CosMx panel file lists more than genes. Two kinds of entry must be excluded before anything is scored,
-and they need different evidence:
-
-  * **Control probes** -- negative controls, blanks, antisense, unassigned and deprecated codewords. These are
-    recognisable from the NAME, which is why `is_control` is a prefix test.
-
-  * **Protein (antibody) channels** -- only present on protein add-on slides. These are NOT recognisable from
-    the name: an anti-CD3E antibody channel is called "CD3E", exactly like the RNA. They can only be identified
-    from the feature id in the vendor's `cell_feature_matrix.h5`, where RNA is `ENSG*`/`ENST*` and protein is
-    `TXP*`. Leaving them in is not a rounding error: antibody staining has a far wider dynamic range than RNA
-    counts, so protein channels dominate a variance ranking and take over the HVG list.
-
-    A further trap: some names appear TWICE in the h5, once as RNA and once as protein (CD3E, CD4, CD8A, CD68,
-    CD163, PCNA, PTEN, CD45RA, CD45RO). Preprocessing that deduplicates by name merges the two measurements into
-    one column that can no longer be separated, so `protein_names` returns every name carrying a TXP feature and
-    all of them are dropped -- including the ambiguous ones.
-"""
+"""Select RNA genes and map panels to model outputs. Input: gene names, global-gene TSV, and optional vendor HDF5. Output: gene masks and indices."""
 from __future__ import annotations
 import numpy as np
 

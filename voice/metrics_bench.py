@@ -1,9 +1,4 @@
-"""The scoring the paper reports: per-gene Pearson across cells, and the HVG / SVG gene sets.
-
-Correlation is computed for each gene ACROSS CELLS, then averaged over a gene set -- never per cell. A gene the
-model cannot emit is scored 0 and still counts in the denominator (see `score_against_head`), because dropping
-it would silently reward a model for having a smaller output space.
-"""
+"""Compute expression-recovery metrics. Input: predictions, measured expression, and coordinates. Output: per-gene PCC and HVG/SVG rankings."""
 from __future__ import annotations
 import numpy as np
 
@@ -11,7 +6,7 @@ EPS = 1e-8
 
 
 def per_gene_pcc(P, Y, chunk: int = 512):
-    """P, Y: [N, G] log1p. Returns [G]. Chunked so no [N, G] temporary is allocated for a 700k-cell slide."""
+    """Input: P and Y [N,G]. Output: per-gene PCC [G]."""
     G = P.shape[1]
     out = np.empty(G, np.float32)
     for s in range(0, G, chunk):
@@ -62,14 +57,6 @@ def summarize(pcc, hvg_order, svg_order, ks=(20, 50, 100)):
 
 
 def score_against_head(pred_head, Y, gid, pos, hvg_order=None, svg_order=None, ks=(20, 50, 100)):
-    """Score a head-space prediction on a slide's own panel.
-
-    pred_head : [N, n_head]  the model's output
-    Y         : [N, G_panel] measured log1p, real genes only
-    gid       : [G_panel]    global index of each panel gene, -1 if the head cannot emit it
-
-    Genes with gid < 0 get a constant-zero prediction, hence PCC 0, and still count in the denominator.
-    """
     P = np.zeros_like(Y, dtype=np.float32)
     cov = gid >= 0
     P[:, cov] = pred_head[:, gid[cov]]

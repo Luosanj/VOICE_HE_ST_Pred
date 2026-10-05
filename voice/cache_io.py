@@ -1,13 +1,4 @@
-"""IO for (a) the source cache of embedded slides and (b) the precompute shards.
-
-Source cache per slide:
-  he_emb : <he_emb_dir>/<tissue>/<slide>/features.npz   key 'feats' [N,1536], 'expr_rows', 'entity_ids'
-  expr   : <expr_dir>/<tissue>/<slide>/expr_csr.npz      CSR [N,11251] raw counts (global gene space)
-           <expr_dir>/<tissue>/<slide>/cells.parquet     has gene_panel_id
-Alignment: feats row i corresponds to expr CSR row expr_rows[i]  (we align everything to feats order).
-
-Precompute shard = one slide -> a directory of per-field .npy (memmap-friendly) + meta.json + DONE.
-"""
+"""Read cached cell features and expression. Input: data configuration and slide identifiers. Output: aligned features, counts, coordinates, and gene panels."""
 from __future__ import annotations
 import os, json
 import numpy as np
@@ -15,7 +6,6 @@ import pandas as pd
 from scipy import sparse
 
 
-# ----------------------------- source cache -----------------------------
 class SourceCache:
     def __init__(self, cfg):
         self.he_dir = cfg.paths.he_emb_dir
@@ -45,17 +35,17 @@ class SourceCache:
            he_emb [n,Dhe] f32, y_global [n,11251] CSR (normalize-then-log1p), entity_ids [n],
            panel_id, panel_global_ids [Gp]."""
         z = np.load(os.path.join(self.he_dir, tissue, slide, "features.npz"), allow_pickle=True)
-        feats = z["feats"].astype(np.float32)                       # [N, Dhe], feats order
+        feats = z["feats"].astype(np.float32)
         expr_rows = z["expr_rows"].astype(np.int64)
         entity = np.asarray(z["entity_ids"]).astype(str)
-        xy = np.stack([z["x_pixel"], z["y_pixel"]], 1).astype(np.float32)   # feats order
+        xy = np.stack([z["x_pixel"], z["y_pixel"]], 1).astype(np.float32)
 
         ex_dir = os.path.join(self.expr_dir, tissue, slide)
         csr = sparse.load_npz(os.path.join(ex_dir, "expr_csr.npz")).tocsr()
         cells = pd.read_parquet(os.path.join(ex_dir, "cells.parquet"), columns=["entity_id", "gene_panel_id"])
         panel_id = str(cells["gene_panel_id"].iloc[0])
 
-        # align expr -> feats order, then (optionally) subsample
+
         csr = csr[expr_rows]
         n = feats.shape[0]
         if max_cells is not None and n > max_cells:
@@ -73,15 +63,13 @@ class SourceCache:
         }
 
     def load_coords(self, tissue, slide, entity_ids):
-        """Spatial x/y for the given cells (aligned to `entity_ids` order). Used for SVG (Moran's I)
-        at eval time, read straight from the source features.npz so the precompute cache needn't store it."""
+        """Return spatial x/y coordinates aligned to entity_ids."""
         z = np.load(os.path.join(self.he_dir, tissue, slide, "features.npz"), allow_pickle=True)
         pos = {e: i for i, e in enumerate(np.asarray(z["entity_ids"]).astype(str))}
         idx = np.array([pos[str(e)] for e in entity_ids], dtype=np.int64)
         return np.stack([z["x_pixel"][idx], z["y_pixel"][idx]], 1).astype(np.float32)
 
 
-# ----------------------------- precompute shards -----------------------------
 SHARD_FIELDS = ["entity_ids", "he_emb", "y", "R", "disp", "ref_mask",
                 "sim_stats", "neighbor_stats", "meta", "s_own", "n_neighbors"]
 

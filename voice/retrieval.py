@@ -1,33 +1,4 @@
-"""Stage 3, part one: the retrieval branch.
-
-The direct branch predicts a cell's expression from its image alone. The retrieval branch answers a different
-question — *which cells in a reference cohort look like this one, and what were they expressing?* — and
-averages their measured profiles. The two make different mistakes, which is what makes fusing them worth doing
-(`voice/gate.py`).
-
-    R_i = sum_k softmax(cos(e_i, e_k) / tau)_k * y_k        over the K nearest bank cells
-
-Three details are load-bearing.
-
-**The bank is a set of reference slides with measured expression**, embedded with the *same* encoder as the
-query. Mixing encoders puts query and bank in different spaces and the neighbours become meaningless — this is
-not hypothetical, an earlier version of this project lost the effect that way. `build_bank` therefore records
-which weights produced it, and `crossR` refuses a bank that does not match.
-
-**Panels differ between slides, so retrieval is done per gene signature.** A query gene is predictable only
-from bank slides that actually measure it. Genes are grouped by *which subset of the bank covers them*, and
-each group retrieves against only that subset. A gene no bank slide measures gets NaN — never a silently
-imputed zero.
-
-**Bank expression is z-scored per slide before pooling.** Slides differ in depth and in panel composition, so
-raw counts from two slides are not on one scale; the retrieval output therefore lives in z-space, not in
-log1p-counts space. That is why the gate blends the two branches per gene rather than adding them.
-
-Nearest neighbours are found with an exact torch top-K rather than faiss. `GpuIndexFlatIP` is brute force and
-the project builds it with `useFloat16=True`, so fp16 scoring here returns the same neighbours; faiss is
-avoided because initialising its cuBLAS handle after torch has touched the device aborts on some machines
-(`blasStatus == CUBLAS_STATUS_SUCCESS` failed), even with the GPU otherwise idle.
-"""
+"""Predict expression from reference cells. Input: cell embeddings and a same-tissue reference bank. Output: top-K weighted expression and covered-gene indices."""
 from __future__ import annotations
 import os, json, glob
 from collections import defaultdict
@@ -39,18 +10,13 @@ K_DEFAULT = 200
 TAU_DEFAULT = 0.03
 
 
-# ----------------------------------------------------------------------------- exact top-K
 @torch.no_grad()
 def topk_cosine(Q, bank_E, K=K_DEFAULT, qchunk=1024, bchunk=1_000_000, device="cuda"):
-    """Exact cosine top-K. Returns (D [Nq,K] float32, I [Nq,K] int64), descending.
-
-    The bank is held on the GPU in fp16 blocks and scored block by block, keeping a running top-K, so a bank of
-    several million cells never needs to fit in one allocation.
-
-    ⚠️ `F.normalize`'s second POSITIONAL argument is `p`, not `dim`; both are named here.
-    """
     dev = torch.device(device)
     Nq, M = len(Q), len(bank_E)
+    if M == 0 or K < 1:
+        raise ValueError("Expected a nonempty bank and positive K")
+    K = min(K, M)
     Qt = torch.nn.functional.normalize(
         torch.from_numpy(np.ascontiguousarray(Q, np.float32)), p=2, dim=1).half()
     blocks = []
@@ -63,7 +29,7 @@ def topk_cosine(Q, bank_E, K=K_DEFAULT, qchunk=1024, bchunk=1_000_000, device="c
         qc = Qt[i:i + qchunk].to(dev)
         ds, is_ = [], []
         for blk, off in blocks:
-            sc = qc @ blk.T                              # fp16, same precision as faiss useFloat16
+            sc = qc @ blk.T
             k = min(K, sc.shape[1])
             d, ii = torch.topk(sc, k, dim=1)
             ds.append(d); is_.append(ii + off); del sc
@@ -88,7 +54,7 @@ def knn_R(Q, bank_E, bank_Y, K=K_DEFAULT, tau=TAU_DEFAULT, chunk=1024, device="c
     P = np.empty((len(Q), bank_Y.shape[1]), np.float32)
     for i in range(0, len(Q), chunk):
         d = torch.from_numpy(D[i:i + chunk]).to(dev)
-        w = torch.softmax(d / tau, dim=1)                # exp((d - max)/tau) normalised is exactly this
+        w = torch.softmax(d / tau, dim=1)
         P[i:i + chunk] = torch.einsum(
             "nk,nkg->ng", w, bY[torch.from_numpy(I[i:i + chunk]).to(dev)].float()).float().cpu().numpy()
         del d, w
@@ -97,7 +63,6 @@ def knn_R(Q, bank_E, bank_Y, K=K_DEFAULT, tau=TAU_DEFAULT, chunk=1024, device="c
     return P
 
 
-# ----------------------------------------------------------------------------- the bank
 BANK_SUFFIX = ".bank.npz"
 
 
@@ -142,20 +107,12 @@ def bank_panels(bank_dir, names):
     return out
 
 
-# ----------------------------------------------------------------------------- retrieval over a bank
 def crossR(Eq, panel_q, bank_dir, names=None, K=K_DEFAULT, tau=TAU_DEFAULT,
-           weights_id=None, device="cuda", verbose=True):
-    """Retrieval prediction for one query slide.
-
-    Eq       : [Nq, 1536] query embeddings, from the SAME encoder that built the bank
-    panel_q  : [Gq] global gene ids of the query's panel
-    Returns  : (R [Nq, Gq] float32, NaN where no bank slide measures that gene; covered gene indices)
-
-    Genes are grouped by which bank slides cover them; each group's bank is loaded, used and freed, so peak
-    memory is one group's bank rather than the whole cohort.
-    """
+           weights_id=None, device="cuda", verbose=True, exclude=None):
     import gc
-    names = names or list_bank(bank_dir)
+    names = list_bank(bank_dir) if names is None else names
+    excluded = set(exclude or [])
+    names = [n for n in names if n not in excluded]
     if not names:
         raise SystemExit(f"no bank slides in {bank_dir} — build one with predict/build_bank.py")
     panels = bank_panels(bank_dir, names)
@@ -191,7 +148,7 @@ def crossR(Eq, panel_q, bank_dir, names=None, K=K_DEFAULT, tau=TAU_DEFAULT,
             E, Y, panel, _w = _load(bank_dir, s)
             cols = np.array([panels[s][int(g)] for g in gg], np.int64)
             Ysub = np.asarray(Y[:, cols], np.float32)
-            # z-score per slide: depth and panel composition differ, so raw values are not on one scale
+
             Ys.append((Ysub - Ysub.mean(0, keepdims=True)) / (Ysub.std(0, keepdims=True) + 1e-6))
             Es.append(np.asarray(E, np.float32))
             del E, Y, Ysub

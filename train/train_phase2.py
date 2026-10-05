@@ -1,43 +1,11 @@
 #!/usr/bin/env python
-"""Phase-2 SE2-LoRA (spatial FM) — gene-supervised LoRA-HE on the v2 corpus, WITH A VALIDATION SET.
-
-Same model / data / loss / speed tricks as he2cell_v2_work/se2_lora_v2.py. The ONLY additions are validation:
-
-  --val_frac F      per-slide SPATIAL band hold-out (NOT random cells). Per slide, cut at the x-quantile that puts
-                    fraction F of that slide's cells on the val side; every slide (and therefore every tissue,
-                    including the 1-slide ones) contributes val cells, so no tissue is lost the way a held-out-slide
-                    split would lose it.
-  --val_margin PX   buffer strip between train and val. A patch is TRAIN only if ALL its cells are < (cut - margin),
-                    VAL only if ALL its cells are >= cut; anything straddling is DROPPED. Guarantees every train cell
-                    is > margin px from every val cell.
-  --val_every N     run validation every N optimizer steps (plus at start, at each epoch boundary, and at the end).
-  best checkpoint   the lowest-val-loss state is written to se2_lora_<tag>_best.pt — so checkpoint selection never
-                    touches the held-out benchmark slides (the earlier scale_train.py bug).
-
-WHY A SPATIAL BAND AND NOT RANDOM 10% OF CELLS: the training unit is a 256px patch of <=256 NEIGHBOURING cells and
-the SE(2) decoder consumes that neighbourhood. With a random cell split the same patch would contain both train and
-val cells, so the model sees a val cell's exact neighbourhood while training; val loss then tracks train loss and
-measures nothing. Adjacent cells are also strongly autocorrelated (SVG Moran's I up to ~0.9). The band + margin
-removes both effects, and matches the in-slide benchmark protocol (se2_lora_v2_incv.py: vertical bands + inner-val
-strip), so the training val and the reported in-slide numbers use the same kind of split.
-
-SCOPE / HONESTY: this val band lives inside TRAINING slides, so it measures same-slide-different-region
-generalization. It is optimistic relative to the cross-slide / cross-patient test slides. Its job is checkpoint
-selection and training health, not reporting generalization.
-
-NOTE: --val_frac > 0 removes the val band + margin from training, so steps/epoch differs from the old runs; a run
-started here is not step-compatible with he2cell_v2_work checkpoints. --val_frac 0 reproduces the old behaviour
-exactly (single dataset, no val, no best.pt).
-
-Run:   torchrun --nproc_per_node=3 train_phase2.py --tag p2v3 --val_frac 0.1 --resume
-Check: python train_phase2.py --check_only        Smoke: python train_phase2.py --smoke
-"""
+"""Train the spatial expression decoder with spatial validation. Input: prepared crops, masks, positions, gene panels, counts, and Stage-1 weights. Output: Stage-2 checkpoints."""
 from __future__ import annotations
 import sys, os, pathlib, time, math, argparse
 from datetime import timedelta
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))   # repo root -> `voice` importable
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from voice import paths as _p
-_p.hf_home()                       # HF_HOME / *_OFFLINE, before timm or transformers is imported
+_p.hf_home()
 os.environ.setdefault("HF_HUB_OFFLINE", "1"); os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import torch.distributed as dist
@@ -48,7 +16,7 @@ from voice.clip_lora import build_uni2, inject_lora, pooled_feat, trainable, MEA
 from voice.scale_train import ScaleHE2Cell, nb_nll
 
 V2 = _p.v2_root(); SM = f"{V2}/sample_meta"; CROPS = f"{V2}/crops_raw"; CKDIR = _p.ckpt_dir()
-LORA_CKPT = f"{V2}/ckpts/clip_lora_v2_final.pt"        # Phase-1 backbone (warm-start)
+LORA_CKPT = f"{V2}/ckpts/clip_lora_v2_final.pt"
 GLOBAL_GENES = f"{V2}/global_genes_v2.tsv"; MANIFEST = f"{V2}/manifest_v2.csv"
 AMP = torch.bfloat16
 _HDR = {"gene", "gene_symbol", "symbol", "genes", "name"}
@@ -64,21 +32,12 @@ def sym2glob_map():
     return dict(zip(gg["gene_symbol"].astype(str), gg["global_gene_index"].astype(int))), len(gg)
 
 
-# ---------------------------------------------------------------- data
 class Phase2V2DS(Dataset):
-    """256px spatial patches over the v2 corpus. Per patch: memmap crops (u8) + maskW (f16) + pos + panel raw counts.
-    Row i of crops.u8 / maskW.f16 / expression.npz / boundaries is the SAME cell (alignment asserted at load).
-
-    Validation split (val_frac>0): per slide, cut = x-quantile(1-val_frac) (or quantile(val_frac) with val_side='lo').
-    Each patch is labelled from the x of ALL its cells BEFORE max_cells subsampling (so a lucky subsample can never
-    turn a straddling patch into a 'pure' one):
-        VAL   if min(x) >= cut                          TRAIN if max(x) <  cut - margin        else DROPPED
-    """
     def __init__(self, samples, sym2glob, patch_size=256, overlap=30, max_cells=256, min_cells=2, seed=0, rank0=True,
                  val_frac=0.0, val_margin=256, val_side="hi"):
         self.max_cells = max_cells; self.rng = np.random.RandomState(seed)
         self.cpaths = []; self.wpaths = []; self.pos = []; self.ycsr = []; self.panel = []; self.names = []; self.patches = []
-        self.is_val = []                                                    # per-patch bool, aligned with self.patches
+        self.is_val = []
         self._C = self._W = None
         t0 = time.time(); tot = 0; dropped_panels = []; n_drop = 0; val_cells = 0; tr_cells = 0
         for s in samples:
@@ -99,7 +58,7 @@ class Phase2V2DS(Dataset):
             self.cpaths.append(cp); self.wpaths.append(wp); self.pos.append(np.stack([yp, xp], 1))
             self.ycsr.append(y); self.panel.append(gid); self.names.append(s)
             cy, cx = yp, xp; H = cy.max() + patch_size; W = cx.max() + patch_size
-            # per-slide band cut on the x-quantile of THIS slide's cells (so every slide contributes ~val_frac cells)
+
             cut = float(np.quantile(cx, 1.0 - val_frac)) if val_frac > 0 else None
             for y0 in np.arange(0, H, patch_size - overlap):
                 rm = (cy >= y0) & (cy < y0 + patch_size)
@@ -110,13 +69,13 @@ class Phase2V2DS(Dataset):
                     if cm.sum() < min_cells: continue
                     cells = cyr[cm]
                     isval = False
-                    if val_frac > 0:                                        # label on the FULL cell set, pre-subsample
+                    if val_frac > 0:
                         xs = cx[cells]; lo, hi = float(xs.min()), float(xs.max())
                         in_band = (lo >= cut) if val_side == "hi" else (hi < cut)
                         past_margin = (hi < cut - val_margin) if val_side == "hi" else (lo >= cut + val_margin)
                         if in_band: isval = True
                         elif past_margin: isval = False
-                        else: n_drop += 1; continue                         # straddles band or margin -> drop entirely
+                        else: n_drop += 1; continue
                     if len(cells) > max_cells: cells = self.rng.choice(cells, max_cells, replace=False)
                     self.patches.append((si, np.sort(cells))); self.is_val.append(isval)
                     if isval: val_cells += len(cells)
@@ -142,8 +101,8 @@ class Phase2V2DS(Dataset):
     def __getitem__(self, k):
         if self._C is None: self._open()
         si, cells = self.patches[k]
-        img = np.ascontiguousarray(np.asarray(self._C[si][cells]).transpose(0, 3, 1, 2))    # [n,3,224,224] u8
-        W = np.asarray(self._W[si][cells], np.float32)                                        # [n,16,16]
+        img = np.ascontiguousarray(np.asarray(self._C[si][cells]).transpose(0, 3, 1, 2))
+        W = np.asarray(self._W[si][cells], np.float32)
         pos = self.pos[si][cells]; y = np.asarray(self.ycsr[si][cells].todense(), np.float32)
         return (torch.from_numpy(img), torch.from_numpy(W), torch.from_numpy(pos),
                 torch.from_numpy(y), torch.from_numpy(self.panel[si]))
@@ -155,8 +114,6 @@ def normalize(img_u8, dev):
 
 
 def freeze_first_lora(model, nblocks, frac):
-    """Freeze LoRA in the first ceil(frac*nblocks) of the nblocks LoRA blocks -> trainable LoRA only on the later blocks,
-    so backprop truncates below the first trainable block (grad-ckpt then skips recompute of the frozen prefix)."""
     n = len(model.blocks); nfz = int(math.ceil(frac * nblocks)); fz = 0
     for i in range(n - nblocks, n - nblocks + nfz):
         for mod in (model.blocks[i].attn.qkv, model.blocks[i].attn.proj):
@@ -165,11 +122,9 @@ def freeze_first_lora(model, nblocks, frac):
     return nfz, fz
 
 
-# ---------------------------------------------------------------- gate (validates the memmap/mask shortcut is lossless)
 @torch.no_grad()
 def gate_mask_lossless(ds, model, dev, n=16):
-    """maskW.f16 MUST equal rasterizing the cell boundary to a normalized 16x16 grid, and pooled_feat(crops,maskW) must
-    match pooled_feat(crops, rasterized) at cos~1. One-time, few cells — confirms the 'bit-identical' shortcut."""
+    was_train = model.training; model.eval()
     si, cells = ds.patches[0]; s = ds.names[si]
     bz = np.load(f"{SM}/{s}/patch_cell_boundaries.npz", allow_pickle=True)
     ip = bz["indptr"]; vx = bz["vertex_x_patch"]; vy = bz["vertex_y_patch"]; osize = int(bz["output_size"]); tok = osize // 16
@@ -190,6 +145,7 @@ def gate_mask_lossless(ds, model, dev, n=16):
     cos = float(np.mean((f_c * f_r).sum(1) / (np.linalg.norm(f_c, axis=1) * np.linalg.norm(f_r, axis=1) + 1e-9)))
     ok = dW < 1e-3 and cos > 0.999
     print(f"[gate/mask] {s[:36]}: |maskW-raster|max={dW:.2e}  pooled_feat cos={cos:.6f}  -> {'OK' if ok else 'FAIL'}", flush=True)
+    if was_train: model.train()
     return ok
 
 
@@ -210,7 +166,6 @@ def gate_val_disjoint(ds, val_margin, rank0=True):
     return ok
 
 
-# ---------------------------------------------------------------- ckpt (atomic; permanent per-epoch snapshots)
 def _lora_cpu(model): return {n: p.detach().cpu() for n, p in trainable(model).items()}
 
 def save_latest(path, step, epoch, model, se2, opt, args, best_val=float("inf")):
@@ -224,13 +179,12 @@ def save_artifact(path, model, se2, args, meta, extra):
                args=vars(args), meta=meta); obj.update(extra); torch.save(obj, path)
 
 
-# ---------------------------------------------------------------- validation
 @torch.no_grad()
 def evaluate(val_dl, model, se2, dev, world):
     """Mean per-patch val loss (same MSE[log1p] + 0.5*NB as training), summed across ranks. eval() disables LoRA dropout."""
     was_train = model.training
     model.eval(); se2.eval()
-    tot = torch.zeros(2, device=dev)                                        # [loss_sum, n_patches]
+    tot = torch.zeros(2, device=dev)
     for img, W, pos, y, panel in val_dl:
         with torch.autocast("cuda", dtype=AMP):
             feats = pooled_feat(model, normalize(img, dev), W.to(dev, non_blocking=True))
@@ -261,7 +215,7 @@ def main():
     ap.add_argument("--exclude_inslide", action="store_true", help="also hold out the 5 in-slide benchmark slices (clip_lora.EXCL)")
     ap.add_argument("--init_from", default="", help="warm-start TRAINED lora+se2 from a Phase-2 ckpt (fresh epoch counter/opt)")
     ap.add_argument("--max_steps", type=int, default=0)
-    # ---- validation (the additions over se2_lora_v2.py) ----
+
     ap.add_argument("--val_frac", type=float, default=0.1,
                     help="per-slide spatial band held out for validation (0 = no val, == old se2_lora_v2 behaviour)")
     ap.add_argument("--val_margin", type=float, default=256.0,
@@ -301,41 +255,41 @@ def main():
     ds = Phase2V2DS(samples, sym2glob, args.patch_size, args.overlap, args.max_cells, rank0=r0,
                     val_frac=args.val_frac, val_margin=args.val_margin, val_side=args.val_side)
 
-    # ---- train / val subsets (val = fixed seeded subsample of the band patches, sharded across ranks) ----
+
     tr_idx = np.where(~ds.is_val)[0]; va_idx = np.where(ds.is_val)[0]
     assert len(tr_idx) > 0, "no training patches left — val_frac/val_margin too aggressive"
     train_ds = Subset(ds, tr_idx.tolist())
     val_dl = None
     if args.val_frac > 0 and len(va_idx) > 0:
         if r0: assert gate_val_disjoint(ds, args.val_margin, rank0=True), "VAL SPLIT LEAKS (train/val x gap <= margin)"
-        pick = np.random.RandomState(1234).permutation(va_idx)[:args.val_max_patches]      # same subset on every rank
-        pick = np.sort(pick)[rank::world]                                                   # then shard by rank
+        pick = np.random.RandomState(1234).permutation(va_idx)[:args.val_max_patches]
+        pick = np.sort(pick)[rank::world]
         val_dl = DataLoader(Subset(ds, pick.tolist()), batch_size=1, shuffle=False, num_workers=args.val_workers,
                             pin_memory=True, persistent_workers=args.val_workers > 0,
                             prefetch_factor=4 if args.val_workers else None, collate_fn=lambda b: b[0])
         if r0: print(f"[val] scoring {min(len(va_idx), args.val_max_patches)} of {len(va_idx):,} val patches "
                      f"every {args.val_every} steps ({len(pick)} on rank0)", flush=True)
 
-    # ---- model: LoRA-UNI2 (live) + SE2/NB head ----
+
     model = build_uni2(dev); inject_lora(model, args.nblocks, args.r, args.alpha, args.dropout); model.to(dev)
     for p in model.parameters(): p.requires_grad = False
     for n, p in model.named_parameters():
         if ".A" in n or ".B" in n: p.requires_grad = True
-    lck = torch.load(args.lora_ckpt, map_location=dev, weights_only=False)               # warm-start Phase-1 LoRA
+    lck = torch.load(args.lora_ckpt, map_location=dev, weights_only=False)
     msd = dict(model.named_parameters())
     miss = [n for n in lck["lora"] if n not in msd]
     assert not miss, f"warm-start LoRA keys absent in model: {miss[:4]}"
     for n, v in lck["lora"].items(): msd[n].data.copy_(v.to(dev))
     nfz, _ = freeze_first_lora(model, args.nblocks, args.freeze_frac)
     model.set_grad_checkpointing(True)
-    se2 = ScaleHE2Cell(n_global, feat_dim=1536, d_model=args.d_model, n_layers=args.n_layers).to(dev)   # FRESH head
+    se2 = ScaleHE2Cell(n_global, feat_dim=1536, d_model=args.d_model, n_layers=args.n_layers).to(dev)
     lp = [p for p in model.parameters() if p.requires_grad]; sp = list(se2.parameters())
     if r0:
         print(f"[model] LoRA<-{os.path.basename(args.lora_ckpt)} | trainable LoRA={sum(p.numel() for p in lp)/1e3:.0f}K "
               f"(froze first {nfz}/{args.nblocks} blocks) | SE2 d{args.d_model}/L{args.n_layers}="
               f"{sum(p.numel() for p in sp)/1e6:.1f}M (fresh)", flush=True)
 
-    if args.init_from:                                       # warm-start TRAINED weights (fresh epoch counter/opt)
+    if args.init_from:
         ick = torch.load(args.init_from, map_location=dev, weights_only=False)
         miss2 = [n for n in ick["lora"] if n not in msd]
         assert not miss2, f"init_from LoRA keys absent in model: {miss2[:4]}"
@@ -360,10 +314,10 @@ def main():
         if world > 1: dist.destroy_process_group()
         return
 
-    if world > 1:                                                                        # SE2 is random -> broadcast rank0
+    if world > 1:
         for p in list(model.parameters()) + list(se2.parameters()): dist.broadcast(p.data, 0)
     opt = torch.optim.AdamW([{"params": lp, "lr": args.lr_lora}, {"params": sp, "lr": args.lr_se2}],
-                            weight_decay=1e-4, fused=True)      # fused CUDA kernel: same math, faster step
+                            weight_decay=1e-4, fused=True)
 
     sampler = DistributedSampler(train_ds, world, rank, shuffle=True, drop_last=True) if world > 1 else None
     dl = DataLoader(train_ds, batch_size=1, sampler=sampler, shuffle=(sampler is None), drop_last=True,
@@ -386,8 +340,8 @@ def main():
         print(f"[train] {spe} steps/epoch x {args.epochs} = {total} | world={world} | warmup={warmup} "
               f"| lr_lora={args.lr_lora} lr_se2={args.lr_se2}", flush=True)
 
-    def lr_at(s):                                                                         # linear warmup -> cosine decay
-        # --const_lr F: NO-SPIKE EXTENSION (see se2_lora_v2.py). Flat lr = F*base for continued fitting.
+    def lr_at(s):
+
         if args.const_lr > 0: return args.const_lr
         if s < warmup: return (s + 1) / warmup
         t = (s - warmup) / max(1, total - warmup); return 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
@@ -407,7 +361,7 @@ def main():
                               dict(step=step, val_loss=vl, steps_per_epoch=spe, epoch_index=step // max(1, spe)))
         if world > 1: dist.barrier()
 
-    def run_step(img, W, pos, y, panel):                                                  # one patch fwd+bwd (grads set)
+    def run_step(img, W, pos, y, panel):
         model.train(); se2.train()
         with torch.autocast("cuda", dtype=AMP):
             feats = pooled_feat(model, normalize(img, dev), W.to(dev, non_blocking=True))
@@ -416,12 +370,12 @@ def main():
         loss = F.mse_loss(lm[:, p].float(), torch.log1p(yy)) + 0.5 * nb_nll(yy, aux["mu"][:, p].float(), aux["log_theta"][p].float().exp())
         loss.backward(); return float(loss.detach())
 
-    if not args.no_val_at_start: do_val("start")                                          # baseline of the warm-start
+    if not args.no_val_at_start: do_val("start")
     t0 = time.time(); run = 0.0; step0 = step
     for ep in range(ep0, args.epochs):
         if sampler: sampler.set_epoch(ep)
         epoch_dl, skip = dl, max(step - ep * spe, 0) if ep == ep0 else 0
-        if skip > 0 and sampler is not None:                                              # resume: slice order, 0 wasted reads
+        if skip > 0 and sampler is not None:
             order = list(iter(sampler))[skip:]
             epoch_dl = DataLoader(train_ds, batch_size=1, sampler=order, drop_last=True, num_workers=args.workers,
                                   pin_memory=True, persistent_workers=False, collate_fn=lambda b: b[0],
@@ -432,7 +386,7 @@ def main():
             opt.zero_grad(set_to_none=True)
             try:
                 loss = run_step(img, W, pos, y, panel)
-            except torch.cuda.OutOfMemoryError:                                            # rare dense patch: halve + retry
+            except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache(); opt.zero_grad(set_to_none=True)
                 h = max(2, img.shape[0] // 2); sel = torch.randperm(img.shape[0])[:h]
                 loss = run_step(img[sel], W[sel], pos[sel], y[sel], panel)
@@ -452,7 +406,7 @@ def main():
             at_epoch_end = cur_ep > saved_ep
             if args.val_every > 0 and (step % args.val_every == 0 or at_epoch_end or step >= total):
                 do_val("epoch-end" if at_epoch_end else ("final" if step >= total else "periodic"))
-            if r0 and at_epoch_end:                                                        # permanent per-epoch snapshot
+            if r0 and at_epoch_end:
                 ei = cur_ep - 1
                 save_artifact(f"{CKDIR}/se2_lora_{args.tag}_epoch{ei}.pt", model, se2, args,
                               f"Phase-2 SE2-LoRA epoch {ei}", dict(epoch_index=ei, step=step, steps_per_epoch=spe))

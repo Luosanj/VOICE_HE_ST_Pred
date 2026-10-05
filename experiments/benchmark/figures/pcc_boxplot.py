@@ -1,21 +1,8 @@
 #!/usr/bin/env python
-"""Per-gene PCC distributions, as box plots.
-
-    python benchmark/figures/pcc_boxplot.py --preds VOICE=preds/slide.npz Baseline=other/slide.npz --out fig.png
-
-One box per method, over the per-gene correlations on a slide. The distribution is the point: a mean hides
-whether a method is uniformly mediocre or excellent on some genes and useless on others, which is exactly the
-difference that matters for a gene panel.
-
-With several `--preds` entries the genes are intersected first, so every method is summarised over the same set.
-Only genes each method can actually emit are eligible; how many were dropped is printed, because a method with a
-smaller output space would otherwise look better simply by being scored on fewer genes.
-
-`--gene_set` restricts to the top-N HVG or SVG from a canonical list (benchmark/gene_lists.py).
-"""
+"""Plot per-gene prediction correlations. Input: saved prediction NPZ files and optional gene list. Output: PCC boxplot image."""
 from __future__ import annotations
 import os, sys, argparse, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent.parent))
 import numpy as np
 
 
@@ -60,7 +47,7 @@ def main():
     keep = set.intersection(*covered)
     if a.gene_set != "all":
         if not a.gene_list:
-            sys.exit("--gene_set needs --gene_list (a <slide>.tsv from benchmark/gene_lists.py)")
+            sys.exit("--gene_set needs --gene_list (a <slide>.tsv from experiments/benchmark/gene_lists.py)")
         import pandas as pd
         gl = pd.read_csv(a.gene_list, sep="\t")
         col = "hvg_rank" if a.gene_set.startswith("hvg") else "svg_rank"
@@ -76,14 +63,14 @@ def main():
     data = [[series[l][g] for g in genes] for l in labels]
     fig, ax = plt.subplots(figsize=(1.5 + 1.1 * len(labels), 4.2))
     kw = dict(showfliers=False, widths=0.6, patch_artist=True, medianprops=dict(color="black", lw=1.4))
-    try:                                     # renamed in Matplotlib 3.9
+    try:
         bp = ax.boxplot(data, tick_labels=labels, **kw)
     except TypeError:
         bp = ax.boxplot(data, labels=labels, **kw)
     cmap = plt.get_cmap("tab10")
     for i, b in enumerate(bp["boxes"]):
         b.set_facecolor(cmap(i % 10)); b.set_alpha(0.65); b.set_linewidth(0.8)
-    for i, vals in enumerate(data):                       # jittered points, so n is visible
+    for i, vals in enumerate(data):
         xj = np.random.RandomState(0).normal(i + 1, 0.055, len(vals))
         ax.plot(xj, vals, ".", ms=1.6, color="0.25", alpha=0.35, zorder=3)
     ax.set_ylabel("per-gene PCC", fontsize=11)

@@ -1,27 +1,8 @@
 #!/usr/bin/env python
-"""Fit the Stage-3 per-gene gate on reference slides, so it can be transferred to a target that has no labels.
-
-    python benchmark/fit_gate.py --release weights/voice-23m --bank bank/lung \\
-        --prepared /data/ref/lung_a /data/ref/lung_b --out gate_lung.json
-
-The gate is one weight per gene, `pred = beta_g * A_g + (1 - beta_g) * R_g`. Choosing beta needs measured
-expression, which the target does not have — that is the whole point of predicting it. So beta is fitted on
-**reference** slides of the same tissue and transferred unchanged.
-
-**Each reference is scored against a bank that excludes itself.** A reference retrieved from a bank containing
-it finds its own cells and reports its own labels; the resulting R looks far better than anything the target
-will see, and the transferred beta then trusts retrieval far too much. This script enforces the exclusion — it
-drops each reference from the bank while that reference is being fitted — rather than leaving it to the caller.
-
-Give at least two reference slides. With one, the bank for it is empty and nothing can be fitted; and a beta
-from a single slide carries that slide's idiosyncrasies into the target.
-
-Output is a JSON mapping global gene id -> beta, averaged over the references. Feed it to
-`predict/predict.py --gate`.
-"""
+"""Fit reference-slide fusion weights. Input: same-tissue prepared references, model weights, and an excluding retrieval bank. Output: global-gene-ID to beta JSON."""
 from __future__ import annotations
 import os, sys, json, argparse, time, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 import numpy as np
 from voice import paths as _p
 _p.hf_home()
@@ -80,6 +61,7 @@ def main():
         t0 = time.time()
         src = open_slide(prepared=d)
         Y_ref, panel_ref, _np_, _no = slide_expression(d, sym2glob)
+        Y_ref = Y_ref[src.er]
         if len(Y_ref) != len(src):
             raise SystemExit(f"{name}: expression has {len(Y_ref)} rows but the slide has {len(src)} cells.")
 
@@ -101,9 +83,9 @@ def main():
         print(f"  [{name}] A + embeddings done ({time.time()-t0:.0f}s); retrieving from "
               f"{len(others)} other slide(s)", flush=True)
 
-        R, _cov = crossR(E, gid_head, a.bank, names=others, K=a.knn, tau=a.tau,
+        R, _cov = crossR(E, gid_head, a.bank, names=others, exclude={name}, K=a.knn, tau=a.tau,
                          weights_id=wid, device=a.device, verbose=False)
-        # line the reference's measured genes up with the head's columns
+
         col = {int(g): j for j, g in enumerate(gid_head)}
         keep = [(j, col[int(g)]) for j, g in enumerate(panel_ref) if int(g) in col]
         if not keep:

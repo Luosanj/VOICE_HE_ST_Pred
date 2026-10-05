@@ -1,11 +1,7 @@
-"""Loading a trained VOICE model and running it over a benchmark slide.
-
-Shared by both evaluations so they cannot drift apart, and identical to what `predict/predict.py` does -- the
-numbers a user reproduces come from the same code path as the numbers they would get on their own slide.
-"""
+"""Run trained models on benchmark cells. Input: checkpoints, slide crops, boundaries, and coordinates. Output: expression predictions and optional features."""
 from __future__ import annotations
 import os, sys, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 import numpy as np
 from voice import paths as _p
 _p.hf_home()
@@ -46,7 +42,7 @@ def predict_slide(model, se2, slide, pos, poly, n_genes, mpp=None, tile_px=256, 
                   device="cuda", return_features=False):
     """[n_cells, n_genes] log1p(mu), plus the 1536-d pooled features when asked (needed for retrieval)."""
     dev = torch.device(device)
-    src = WSISlide.__new__(WSISlide)                 # the benchmark already loaded cells; reuse them as-is
+    src = WSISlide.__new__(WSISlide)
     src.image = slide.image; src.pos = pos; src.poly = poly
     src.mpp = mpp; src.crop_px = crop_px_for(mpp); src._rd = None
     tiles = tile(pos, tile_px)
@@ -69,7 +65,7 @@ def predict_slide(model, se2, slide, pos, poly, n_genes, mpp=None, tile_px=256, 
 
 
 def gene_orders(gene_list_tsv, genes):
-    """HVG/SVG orderings as positions into `genes`, from a canonical list built by benchmark/gene_lists.py."""
+    """HVG/SVG orderings as positions into `genes`, from a canonical list built by experiments/benchmark/gene_lists.py."""
     import pandas as pd
     gl = pd.read_csv(gene_list_tsv, sep="\t")
     pos_of = {g: i for i, g in enumerate(genes)}

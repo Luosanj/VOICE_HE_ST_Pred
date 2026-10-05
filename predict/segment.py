@@ -1,31 +1,5 @@
 #!/usr/bin/env python
-"""Segment nuclei in an H&E slide and write the `cells.npz` that `predict/predict.py` consumes.
-
-    python predict/segment.py --image slide.svs --out cells.npz --mpp 0.25
-
-Cellpose-SAM ('cpsam') runs on the haematoxylin-dominated blue channel. A whole slide does not fit in memory or
-in a single forward pass, so it is processed in overlapping windows: each window is segmented independently, and
-a nucleus is kept only if its centroid lies in the window's non-overlapping interior. That rule assigns every
-nucleus to exactly one window, so nuclei straddling a window seam are neither duplicated nor lost -- the window
-whose interior contains the centroid also contains enough context around it to segment it properly, which is
-what the overlap is for.
-
-Cellpose expects nuclei at roughly the diameter it was trained on. Pass `--mpp` and the window is rescaled so
-nuclei appear at a consistent size regardless of your scanner; coordinates are mapped back to full-resolution
-slide pixels before writing.
-
-Output keys (this is the whole contract -- write them yourself if you already have segmentations):
-
-    y_pixel, x_pixel   [N] float32   centroids in SLIDE pixels
-    indptr             [N+1] int64   polygon offsets into vertex_*
-    vertex_x, vertex_y [V] float32   polygon vertices in SLIDE pixels
-    cell_id            [N] str
-    area_px            [N] float32   area at full resolution, diagnostic only
-
-Segmentation quality matters: the per-cell feature is a mask-weighted average over the encoder's patch tokens,
-so the boundary decides which image evidence is attributed to this cell rather than to its neighbour. If you
-have boundaries from your own pipeline -- or paired with a spatial assay -- prefer them over this script.
-"""
+"""Segment nuclei in an H&E slide. Input: whole-slide image and resolution. Output: cells.npz containing centroids and polygons."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -33,8 +7,8 @@ import numpy as np
 
 from predict.slide_io import SlideReader
 
-MPP_REF = 0.2125           # the resolution the reference nuclei diameters are quoted at
-MIN_AREA_PX = 15           # Cellpose min_size, applied in the (possibly rescaled) window frame
+MPP_REF = 0.2125
+MIN_AREA_PX = 15
 
 
 def _require(mod, pip):
@@ -67,7 +41,7 @@ def polygons_from_labels(lab, min_area: int):
     n = int(lab.max())
     if n == 0:
         return out
-    # one pass over bounding boxes instead of n full-image comparisons (that is O(n * image) and never finishes)
+
     from scipy import ndimage as ndi
     objs = ndi.find_objects(lab)
     for i, sl in enumerate(objs, start=1):
@@ -110,7 +84,7 @@ def main():
 
     rd = SlideReader(a.image)
     mpp = a.mpp if a.mpp is not None else rd.mpp
-    scale = (mpp / MPP_REF) if mpp else 1.0          # >1 => coarser than reference => upsample the window
+    scale = (mpp / MPP_REF) if mpp else 1.0
     print(f"[slide] {a.image} {rd.width}x{rd.height} via {rd.backend} | "
           f"mpp={mpp if mpp else 'unknown'} -> window scale {scale:.3f}", flush=True)
     if mpp is None:
@@ -134,7 +108,7 @@ def main():
                 break
             side = W + 2 * ov
             rgb = rd.region(x0 - ov, y0 - ov, side)
-            if rgb.max() == 0:                                  # fully outside the image
+            if rgb.max() == 0:
                 continue
             if abs(scale - 1.0) > 1e-3:
                 from PIL import Image
@@ -143,11 +117,11 @@ def main():
             else:
                 rgb_s, s = rgb, side
             lab = segment_window(model, rgb_s, a.channel, a.niter, a.flow_threshold, a.cellprob_threshold)
-            inv = side / float(s)                               # window-scaled px -> slide px
+            inv = side / float(s)
             for cx, cy, area, c in polygons_from_labels(lab, MIN_AREA_PX):
                 gx = (x0 - ov) + cx * inv
                 gy = (y0 - ov) + cy * inv
-                # keep only centroids in this window's OWN interior -> every nucleus assigned exactly once
+
                 if not (x0 <= gx < x0 + W and y0 <= gy < y0 + W):
                     continue
                 if not (0 <= gx < rd.width and 0 <= gy < rd.height):

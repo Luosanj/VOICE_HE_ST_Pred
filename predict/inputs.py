@@ -1,38 +1,9 @@
-"""Where the model's input crops come from. Two sources, one interface.
-
-VOICE needs three things per cell: a crop centred on it, a mask saying which pixels of that crop are the cell,
-and the cell's slide coordinates. Those can be produced two ways, and downstream code should not care which:
-
-**A whole-slide image plus segmentations** (`WSISlide`). Crops are cut from the image on the fly. This is the
-path for a slide you just scanned: run `predict/segment.py`, then predict. The crop side is derived from your
-resolution so the field of view matches training.
-
-**An already-prepared slide** (`PreparedSlide`). Crops were written to disk ahead of time, one PNG per cell,
-alongside the polygons in crop-local coordinates. This is the layout the training and benchmark corpora use:
-
-    <slide>/
-        patch_cell_boundaries.npz    expr_rows, indptr, vertex_x_patch, vertex_y_patch, x_pixel, y_pixel,
-                                     output_size, crop_px
-        manifest.csv.gz              expr_row -> patch_path
-        patches/                     the crops
-        expression.npz, genes.tsv    optional; only needed to SCORE a prediction
-
-Prepared slides need no resolution argument: the crop was already cut at the right physical size, and the
-polygon coordinates are already in the crop's frame. That makes this path exactly reproducible -- the same
-bytes go into the encoder every time -- which is why the benchmark uses it.
-
-Both classes expose the same three methods, so `predict/predict.py` and `benchmark/` treat them identically:
-
-    len(src)                 number of cells
-    src.pos                  [N,2] float32, (y, x) in slide pixels
-    src.ids                  [N] str
-    src.batch(idx)           (uint8 [n,3,224,224], float32 [n,16,16]) for the cells at `idx`
-"""
+"""Load whole-slide or prepared cell crops. Input: image/cells.npz or a prepared slide directory. Output: RGB crops, masks, coordinates, and optional measured expression."""
 from __future__ import annotations
 import os
 import numpy as np
 
-from predict.geometry import polygon_mask, crop_px_for, OUTPUT_SIZE, TOKEN_GRID
+from predict.geometry import polygon_mask, crop_px_for, OUTPUT_SIZE, TOKEN_GRID, MPP_REF
 
 
 class WSISlide:
@@ -60,13 +31,13 @@ class WSISlide:
     def __len__(self): return len(self.pos)
 
     def describe(self):
-        fov = self.crop_px * (self.mpp or 0.2125)
+        fov = self.crop_px * (self.mpp or MPP_REF)
         return (f"{os.path.basename(self.image)} {self.width}x{self.height} via {self.backend} | "
                 f"mpp={self.mpp if self.mpp else 'unknown'} -> crop {self.crop_px:.1f} px = {fov:.1f} um | "
                 f"polygons: {'yes' if self.poly else 'NO (centre-token mask)'}")
 
     def _reader(self):
-        if self._rd is None:                      # opened per worker: slide handles are not fork-safe
+        if self._rd is None:
             from predict.slide_io import SlideReader
             self._rd = SlideReader(self.image)
         return self._rd
@@ -77,7 +48,7 @@ class WSISlide:
         imgs = self._reader().crops(cx, cy, self.crop_px, OUTPUT_SIZE)
         W = np.empty((len(idx), TOKEN_GRID, TOKEN_GRID), np.float32)
         half = self.crop_px / 2.0
-        s = OUTPUT_SIZE / self.crop_px            # slide px -> crop frame
+        s = OUTPUT_SIZE / self.crop_px
         for j, c in enumerate(idx):
             if self.poly is None:
                 W[j] = polygon_mask(np.empty(0), np.empty(0))
@@ -130,7 +101,7 @@ class PreparedSlide:
                 im = im.resize((OUTPUT_SIZE, OUTPUT_SIZE), Image.BILINEAR)
             imgs[j] = np.ascontiguousarray(np.asarray(im, np.uint8).transpose(2, 0, 1))
             a, b = int(self.ip[c]), int(self.ip[c + 1])
-            # vertices are already in the crop frame; rescale only if the stored crop is not 224 px
+
             sx = OUTPUT_SIZE / self.output_size
             W[j] = polygon_mask(self.vx[a:b] * sx, self.vy[a:b] * sx)
         return imgs, W
@@ -148,7 +119,7 @@ class PreparedSlide:
         h5 = os.path.join(self.dir, "features.h5")
         mask, _n = real_gene_mask(genes, h5 if os.path.exists(h5) else None)
         cols = np.where(mask)[0]
-        return np.log1p(np.asarray(X[:, cols].todense(), np.float32)), [genes[i] for i in cols]
+        return np.log1p(np.asarray(X[self.er][:, cols].todense(), np.float32)), [genes[i] for i in cols]
 
 
 def open_slide(image=None, cells=None, prepared=None, mpp=None):

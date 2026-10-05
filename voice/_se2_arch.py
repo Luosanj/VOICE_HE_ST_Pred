@@ -1,9 +1,4 @@
-"""[VOICE] SE(2)-equivariant decoder / negative-binomial head.
-
-Contributed by Yicheng Tao as part of the VOICE work; vendored here so the repository is
-self-contained. Behaviour is unchanged from the original.
-"""
-"""UNI (frozen) -> SE(2) Transformer -> [optional ref cross-attn] -> linear gene head. MSE loss."""
+"""Apply spatial attention to cell features. Input: feature vectors and cell coordinates. Output: spatial cell representations."""
 
 import math
 from typing import Optional
@@ -13,13 +8,6 @@ import timm
 
 
 class UNIEncoder(nn.Module):
-    """
-    UNI ViT-L/16 (frozen) + trainable projection head.
-
-    forward(x):
-        x is patches [N, 3, H, W]    -> run UNI -> proj
-        x is features [N, 1024]      -> skip UNI, just proj (use precomputed features)
-    """
 
     UNI_DIM = 1024
 
@@ -36,15 +24,15 @@ class UNIEncoder(nn.Module):
                 p.requires_grad = False
         else:
             self.uni = None
-        # feat_dim allows concatenated multi-backbone caches (e.g. UNI(+)Phikon = 2048).
+
         self.proj = nn.Sequential(nn.Linear(feat_dim, d_model), nn.LayerNorm(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 4:
             assert self.uni is not None, "UNI not loaded but raw patches passed"
             with torch.no_grad():
-                x = self.uni(x)  # [N, 1024]
-        return self.proj(x)  # [N, d_model]
+                x = self.uni(x)
+        return self.proj(x)
 
 
 class GaussianModule(nn.Module):
@@ -113,7 +101,7 @@ class SE2Transformer(nn.Module):
         self.norm_out = nn.LayerNorm(d_model)
 
     def forward(self, x, pos):
-        # x: [N, d_model], pos: [N, 2] (y, x in pixels)
+
         diff = pos.unsqueeze(0) - pos.unsqueeze(1)
         D = diff.norm(dim=-1)
         Z = self.gaussian(D)
@@ -124,14 +112,6 @@ class SE2Transformer(nn.Module):
 
 
 class SimpleHE2Cell(nn.Module):
-    """
-    Default pipeline:  UNI(frozen) -> SE(2) Transformer -> linear gene head.
-
-    Optional reference cross-attention: pass `ref_module` to insert a layer
-    between SE(2) output and the gene head. The module is expected to accept
-    `(h, training)` and return either `h_refined` or `(h_refined, aux)`.
-    Leave as None for the minimal UNI + SE(2) + MSE baseline.
-    """
 
     def __init__(
         self,
@@ -155,7 +135,7 @@ class SimpleHE2Cell(nn.Module):
         )
 
     def forward(self, patches_or_features, pos):
-        # patches: [N, 3, H, W] OR pre-cached UNI features [N, 1024]
+
         x = self.encoder(patches_or_features)
         h = self.se2(x, pos)
         if self.ref_module is not None:

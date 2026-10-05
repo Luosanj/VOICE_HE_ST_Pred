@@ -1,19 +1,4 @@
-"""Loading a released VOICE model from safetensors.
-
-The released weights are two flat safetensors files plus a `config.json`. Flat is what safetensors stores, so
-the nested structure the model code expects (`lora`, `se2`, `he_tower`, ...) is encoded in the tensor names as
-`group/param` and rebuilt here.
-
-Both stages are needed and their order matters. Stage 1 carries a LoRA adapter for every block it adapted;
-Stage 2 ships only the tensors it further trained, and is applied on top. Loading Stage 2 alone leaves the
-remaining blocks at the frozen encoder, which does not fail loudly -- it just predicts worse.
-
-    from voice.release import load_release
-    model, se2, cfg = load_release("release/voice-23m", device="cuda")
-
-`load_release` also accepts the two `.safetensors` paths directly, and falls back to the original `.pt`
-checkpoints so that internal runs and released runs go through the same code path.
-"""
+"""Load trained model weights. Input: release directory or Stage-1/Stage-2 checkpoints. Output: encoder, spatial decoder, and model configuration."""
 from __future__ import annotations
 import os, json
 import torch
@@ -40,11 +25,6 @@ def read_weights(path, device="cpu"):
 
 
 def load_release(where, device="cuda", stage1=None, stage2=None):
-    """Build the LoRA-adapted encoder and the SE(2)+NB head from a release directory.
-
-    Returns (encoder, se2_head, config). `config` is the release config.json when there is one, otherwise a
-    dict reconstructed from the checkpoints, so callers can treat both the same way.
-    """
     from voice.encoder import build_uni2, inject_lora, load_lora
     from voice.scale_train import ScaleHE2Cell
 
@@ -65,8 +45,7 @@ def load_release(where, device="cuda", stage1=None, stage2=None):
     w1 = read_weights(stage1, "cpu")
     w2 = read_weights(stage2, "cpu")
 
-    # config.json uses release names (lora_rank, ...); a raw .pt carries the training names (r, ...).
-    # Reading both means an internal checkpoint and a release load through the same path.
+
     ALIAS = {"lora_blocks": "nblocks", "lora_rank": "r", "lora_alpha": "alpha", "lora_dropout": "dropout"}
     def A(key, default=None):
         if key in cfg:

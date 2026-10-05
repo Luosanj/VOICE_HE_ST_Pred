@@ -1,28 +1,5 @@
 #!/usr/bin/env python
-"""Phase-1 LoRA-CLIP (spatial FM) — he <-> scFoundation InfoNCE with a LIVE LoRA-UNI2-h, WITH A VALIDATION SET.
-
-Same model / data / GradCache / DDP / gates as the original Phase-1 script. The ONLY additions are validation:
-
-  --val_frac F      per-slide SPATIAL band hold-out (NOT random cells), same rule as Phase-2's train_phase2.py:
-                    cut at each slide's x-quantile so fraction F of ITS cells fall in the band. Every slide (hence
-                    every tissue, including the 1-slide ones) contributes val cells.
-  --val_margin PX   buffer between train and val cells. DEFAULT 256 >= the 224 px crop width, which is the point:
-                    two cells closer than 224 px have PHYSICALLY OVERLAPPING crops, so a random cell split would put
-                    near-duplicate images in train and val. The margin makes train and val crops pixel-disjoint.
-  --val_every N     validate every N optimizer steps (plus at start, at each epoch boundary, and at the end).
-  best checkpoint   lowest val InfoNCE -> clip_lora_<tag>_best.pt (same artifact format as epoch<N>/final).
-
-Reported each validation: val InfoNCE (the training objective) and in-batch retrieval R@1 both directions
-(he->scF, scF->he). R@1 is the interpretable number; InfoNCE is what selects the checkpoint.
-
-⚠ InfoNCE depends on the number of in-batch negatives, so validation uses a FIXED --val_batch with drop_last, and a
-FIXED seeded subset of val cells, or the numbers would not be comparable across steps.
-
---val_frac 0 reproduces clip_lora_v2.py exactly (no split, no val, no best.pt).
-
-Run:   torchrun --nproc_per_node=2 train_phase1.py --tag v3 --epochs 3 --val_frac 0.1 --resume
-Smoke: python train_phase1.py --smoke        (gates + split report only, no training)
-"""
+"""Train contrastive image-expression alignment with spatial validation. Input: prepared crops, masks, and scFoundation embeddings. Output: LoRA adapters and alignment checkpoints."""
 from __future__ import annotations
 import os, sys, pathlib, time, json, argparse, math
 os.environ.setdefault("HF_HUB_OFFLINE", "1"); os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -32,11 +9,11 @@ from datetime import timedelta
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from PIL import Image, ImageDraw
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))   # repo root -> `voice` importable
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from voice import paths as _p
-_p.hf_home()                       # HF_HOME / *_OFFLINE, before timm or transformers is imported
+_p.hf_home()
 from voice.clip_lora import (build_uni2, inject_lora, pooled_feat, norm, MEAN, STD, HeTower, ScfTower,
-                       infonce, trainable, TEMP, AMP_DTYPE)                        # v1's validated numerics
+                       infonce, trainable, TEMP, AMP_DTYPE)
 
 V2 = _p.v2_root()
 CROPS = f"{V2}/crops_raw"; SCF = f"{V2}/cell_emb_scf"; SM = f"{V2}/sample_meta"
@@ -44,14 +21,12 @@ V1_SCF = _p.scf_dir()
 CKDIR = f"{V2}/ckpts"; S = 224
 
 
-# ---------------------------------------------------------------- data
 class MemmapCLIPDS(Dataset):
-    """Flat index over cells. Zero decode, zero PIL: uint8 crop + fp16 mask + fp16 scF straight from disk.
-    Memmaps are opened LAZILY per worker (a np.memmap does not survive fork cleanly)."""
+    """Load uint8 cell crops, fp16 masks, and fp16 scFoundation features from memmaps."""
 
     def __init__(self, samples, sid, row):
-        self.samples = samples                       # list[(sample_id, crops_path, maskw_path, scf_path)]
-        self.sid = sid; self.row = row               # int16[N], int32[N]
+        self.samples = samples
+        self.sid = sid; self.row = row
         self._c = self._w = self._s = None
 
     def _open(self):
@@ -64,27 +39,22 @@ class MemmapCLIPDS(Dataset):
     def __getitem__(self, k):
         if self._c is None: self._open()
         i, r = int(self.sid[k]), int(self.row[k])
-        img = np.asarray(self._c[i][r])                                   # (224,224,3) uint8, already decoded
+        img = np.asarray(self._c[i][r])
         return (torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1))),
                 torch.from_numpy(np.asarray(self._w[i][r], np.float32)),
                 torch.from_numpy(np.asarray(self._s[i][r], np.float32)))
 
 
 def _cell_x(sid, sdir):
-    """x_pixel of every cell of a sample, row-aligned with crops.u8 (same expr_row order the whole corpus uses).
-
-    Cached to a tiny x_pixel.npy: patch_cell_boundaries.npz also holds the per-cell polygon vertices, so pulling
-    x_pixel out of it costs ~11 s/slide (~15 min over the corpus) and that would be paid on EVERY launch/resume.
-    With the cache the second launch is ~1 s. Cache misses are harmless (read-only dir -> just slow again)."""
     cache = f"{SM}/{sid}/x_pixel.npy"
     if os.path.exists(cache):
         try: return np.load(cache)
-        except Exception: pass                                   # truncated/racing write -> fall through and redo
+        except Exception: pass
     for p in (f"{SM}/{sid}/patch_cell_boundaries.npz", os.path.join(str(sdir), "patch_cell_boundaries.npz")):
         if os.path.exists(p):
             x = np.load(p, allow_pickle=True)["x_pixel"].astype(np.float32)
             try:
-                tmp = f"{cache}.{os.getpid()}.tmp.npy"; np.save(tmp, x); os.replace(tmp, cache)   # atomic, rank-safe
+                tmp = f"{cache}.{os.getpid()}.tmp.npy"; np.save(tmp, x); os.replace(tmp, cache)
             except OSError:
                 pass
             return x
@@ -92,10 +62,6 @@ def _cell_x(sid, sdir):
 
 
 def build_index(rank0=True, max_cells=0, val_frac=0.0, val_margin=256.0, val_side="hi"):
-    """Flat (sample, row) index over training cells whose scF embedding is non-degenerate (v1 dropped these too).
-
-    val_frac>0 additionally splits each sample by x: VAL if x >= cut, TRAIN if x < cut - margin, else DROPPED
-    (cut = that sample's x-quantile(1-val_frac) over its good cells). Returns (train_ds, val_ds, samples)."""
     mf = pd.read_csv(f"{V2}/manifest_v2.csv"); tr = mf[mf.in_training]
     samples, sids, rows, vsids, vrows, skipped = [], [], [], [], [], []
     n_drop = 0; gaps = []
@@ -103,12 +69,12 @@ def build_index(rank0=True, max_cells=0, val_frac=0.0, val_margin=256.0, val_sid
         sid = r["sample"]
         cp = f"{CROPS}/{sid}/crops.u8"; wp = f"{CROPS}/{sid}/maskW.f16"
         sp = f"{SCF}/{sid}/scf_cellemb.npy"
-        if not os.path.exists(sp): sp = f"{V1_SCF}/{sid}/scf_cellemb.npy"    # the 29 v1 samples reuse their embeddings
+        if not os.path.exists(sp): sp = f"{V1_SCF}/{sid}/scf_cellemb.npy"
         if not (os.path.exists(cp) and os.path.exists(wp) and os.path.exists(sp)):
             skipped.append(sid); continue
         sc = np.load(sp, mmap_mode="r"); nc = np.load(cp, mmap_mode="r").shape[0]
         assert sc.shape[0] == nc, f"{sid}: scF {sc.shape[0]} != crops {nc} (row alignment broken)"
-        good = np.where(np.abs(np.asarray(sc[:, :64], np.float32)).sum(1) > 0)[0]   # degenerate scF cells are all-zero
+        good = np.where(np.abs(np.asarray(sc[:, :64], np.float32)).sum(1) > 0)[0]
         i = len(samples); samples.append((sid, cp, wp, sp))
         if val_frac > 0:
             x = _cell_x(sid, r.get("sample_dir", ""))
@@ -127,7 +93,7 @@ def build_index(rank0=True, max_cells=0, val_frac=0.0, val_margin=256.0, val_sid
     sid = np.concatenate(sids); row = np.concatenate(rows)
     vsid = np.concatenate(vsids) if vsids else np.zeros(0, np.int16)
     vrow = np.concatenate(vrows) if vrows else np.zeros(0, np.int32)
-    if max_cells and len(sid) > max_cells:                                  # deterministic subsample (scale ablations)
+    if max_cells and len(sid) > max_cells:
         k = np.sort(np.random.RandomState(0).choice(len(sid), max_cells, replace=False)); sid, row = sid[k], row[k]
     if rank0:
         print(f"[data] {len(samples)} samples ready, {len(skipped)} not yet pre-processed -> "
@@ -146,12 +112,6 @@ def build_index(rank0=True, max_cells=0, val_frac=0.0, val_margin=256.0, val_sid
 
 
 def scf_stats_cached(ds, path, rank0, world=1, chunk=100_000):
-    """mu/sd over the scF bank — streamed once and cached (it is ~147 GB of reads). Computed over the dataset it is
-    GIVEN, so passing the TRAIN dataset keeps val cells out of the input statistics.
-
-    🔴 The first version fancy-indexed a WHOLE sample at once and cast to float64 (66 GB peak) and ran on BOTH ranks
-    -> OOM killer took rank 0 (torchrun reports only `exitcode: -9`). Now rank 0 alone computes in chunk-row blocks
-    (peak 100k x 3072 x 8 B = 2.4 GB), writes the cache, and other ranks poll the filesystem for it."""
     def _load():
         d = np.load(path)
         return (torch.from_numpy(d["mu"]).cuda(), torch.from_numpy(d["sd"]).cuda())
@@ -166,33 +126,27 @@ def scf_stats_cached(ds, path, rank0, world=1, chunk=100_000):
             r = ds.row[ds.sid == i]
             if not len(r): continue
             for k in range(0, len(r), chunk):
-                A = np.asarray(ds._s[i][r[k:k + chunk]], np.float64)            # <= chunk x 3072 -> 2.4 GB
-                s += A.sum(0); ss += np.einsum("ij,ij->j", A, A); n += len(A)   # einsum: no A*A temporary
+                A = np.asarray(ds._s[i][r[k:k + chunk]], np.float64)
+                s += A.sum(0); ss += np.einsum("ij,ij->j", A, A); n += len(A)
                 del A
         mu = s / n; sd = np.sqrt(np.maximum(ss / n - mu * mu, 0)) + 1e-6
         tmp = path + ".tmp.npz"
         np.savez(tmp, mu=mu.astype(np.float32), sd=sd.astype(np.float32)); os.replace(tmp, path)
         print(f"[scf] done over {n:,} cells -> {path}", flush=True)
     elif world > 1:
-        # NOT dist.barrier(): NCCL's collective timeout is 600 s and this pass streams 147 GB. A filesystem poll has
-        # no such deadline.
+
+
         t0 = time.time()
         while not os.path.exists(path):
             if time.time() - t0 > 4 * 3600:
                 raise TimeoutError(f"rank>0 waited 4 h for {path}; rank 0 must have died")
             time.sleep(10)
-        time.sleep(2)                                                           # let the os.replace land
+        time.sleep(2)
     return _load()
 
 
-# ---------------------------------------------------------------- gates
 @torch.no_grad()
 def gate_memmap_lossless(samples, model, dev, n=24):
-    """The pre-decode claims to be LOSSLESS -> the memmap crop MUST be bit-identical to decoding the PNG, and the cached
-    mask MUST equal the PIL rasterisation. Assert exact equality (stronger than cos~1), then compare live pooled_feat.
-
-    ⚠️ Must NOT gate one of the 7 recovered slides: their stored PNGs are still ALL-BLACK (their crops were re-cut from
-    the WSI), so "memmap == PNG" is guaranteed FALSE and would abort training on a bug that is not there."""
     pick = None
     for s in samples:
         mp = os.path.join(CROPS, s[0], "meta.json")
@@ -235,7 +189,7 @@ def gate_memmap_lossless(samples, model, dev, n=24):
 
 
 def gate_gradcache(model, he_tower, scf_tower, ds, dev):
-    """GradCache LoRA grads must ~= naive full-batch grads (v1's check, kept verbatim in spirit)."""
+    """Compare GradCache and naive full-batch LoRA gradients."""
     b = [ds[i] for i in range(32)]
     img = torch.stack([x[0] for x in b]); W = torch.stack([x[1] for x in b]); scf = torch.stack([x[2] for x in b])
     p = next(iter(trainable(model).values()))
@@ -252,13 +206,12 @@ def gate_gradcache(model, he_tower, scf_tower, ds, dev):
     return rel < 1e-2
 
 
-# ---------------------------------------------------------------- step (v1's GradCache + a single all-reduce)
 def gradcache_step(chunks, model, he_tower, scf_tower, opt, dev, world=1, clip_norm=1.0):
     with torch.no_grad(), torch.autocast("cuda", dtype=AMP_DTYPE):
         Zi = [he_tower(pooled_feat(model, norm(i), w.to(dev, non_blocking=True))).float() for i, w, _ in chunks]
         Zg = [scf_tower(s.to(dev, non_blocking=True)).float() for _, _, s in chunks]
     zi = torch.cat(Zi).detach().requires_grad_(True); zg = torch.cat(Zg).detach().requires_grad_(True)
-    loss = infonce(zi, zg); loss.backward(); gi, gg = zi.grad, zg.grad          # negatives = this rank's eff_batch (== v1)
+    loss = infonce(zi, zg); loss.backward(); gi, gg = zi.grad, zg.grad
     opt.zero_grad(set_to_none=True); off = 0
     for img, W, scf in chunks:
         c = img.shape[0]
@@ -267,7 +220,7 @@ def gradcache_step(chunks, model, he_tower, scf_tower, opt, dev, world=1, clip_n
             zg_c = scf_tower(scf.to(dev, non_blocking=True))
         torch.autograd.backward([zi_c.float(), zg_c.float()], [gi[off:off + c], gg[off:off + c]]); off += c
     params = [p for p in model.parameters() if p.requires_grad] + list(he_tower.parameters()) + list(scf_tower.parameters())
-    if world > 1:                                                              # ONE all-reduce, after the last chunk
+    if world > 1:
         for p in params:
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM); p.grad /= world
@@ -275,17 +228,14 @@ def gradcache_step(chunks, model, he_tower, scf_tower, opt, dev, world=1, clip_n
     return float(loss)
 
 
-# ---------------------------------------------------------------- validation
 @torch.no_grad()
 def evaluate_clip(val_dl, model, he_tower, scf_tower, dev, world, chunk):
-    """Val InfoNCE + in-batch retrieval R@1 (he->scF and scF->he). Towers already L2-normalize their output, so the
-    similarity matrix is just zi @ zg.T — no re-normalisation (and no F.normalize p-vs-dim trap)."""
     was_train = model.training
     model.eval(); he_tower.eval(); scf_tower.eval()
-    tot = torch.zeros(4, device=dev)                                            # [loss, r1_i2g, r1_g2i, n_batches]
+    tot = torch.zeros(4, device=dev)
     for img, W, scf in val_dl:
         Zi, Zg = [], []
-        for i in range(0, len(img), chunk):                                     # chunked fwd: same memory knob as training
+        for i in range(0, len(img), chunk):
             with torch.autocast("cuda", dtype=AMP_DTYPE):
                 Zi.append(he_tower(pooled_feat(model, norm(img[i:i + chunk]), W[i:i + chunk].to(dev, non_blocking=True))).float())
                 Zg.append(scf_tower(scf[i:i + chunk].to(dev, non_blocking=True)).float())
@@ -301,12 +251,11 @@ def evaluate_clip(val_dl, model, he_tower, scf_tower, dev, world, chunk):
     return float(tot[0] / n), float(tot[1] / n), float(tot[2] / n), int(tot[3].item())
 
 
-# ---------------------------------------------------------------- ckpt
 def save_ckpt(path, step, epoch, model, he_tower, scf_tower, opt, args, best_val=float("inf")):
     obj = dict(step=step, epoch=epoch, lora={n: p.detach().cpu() for n, p in trainable(model).items()},
                he_tower=he_tower.state_dict(), scf_tower=scf_tower.state_dict(), opt=opt.state_dict(),
                torch_rng=torch.get_rng_state(), np_rng=np.random.get_state(), args=vars(args), best_val=best_val)
-    tmp = path + ".tmp"; torch.save(obj, tmp); os.replace(tmp, path)          # atomic
+    tmp = path + ".tmp"; torch.save(obj, tmp); os.replace(tmp, path)
 def save_artifact(path, model, he_tower, scf_tower, mu, sd, args, meta="", extra=None):
     obj = dict(lora={n: p.detach().cpu() for n, p in trainable(model).items()},
                he_tower=he_tower.state_dict(), scf_tower=scf_tower.state_dict(),
@@ -321,13 +270,13 @@ def main():
     ap.add_argument("--tag", default="v3")
     ap.add_argument("--nblocks", type=int, default=12); ap.add_argument("--r", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32); ap.add_argument("--dropout", type=float, default=0.05)
-    ap.add_argument("--eff_batch", type=int, default=2048)                      # InfoNCE negatives PER RANK (== v1)
-    ap.add_argument("--chunk", type=int, default=256)                           # GPU-memory knob; OOM auto-halves
+    ap.add_argument("--eff_batch", type=int, default=2048)
+    ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr_lora", type=float, default=1.5e-4); ap.add_argument("--lr_tower", type=float, default=1e-3)
     ap.add_argument("--warmup", type=int, default=200); ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--workers", type=int, default=2); ap.add_argument("--max_cells", type=int, default=0)
-    # ---- validation (the additions over clip_lora_v2.py) ----
+
     ap.add_argument("--val_frac", type=float, default=0.1,
                     help="per-slide spatial band held out for validation (0 = no val, == old clip_lora_v2 behaviour)")
     ap.add_argument("--val_margin", type=float, default=256.0,
@@ -349,7 +298,7 @@ def main():
     rank = int(os.environ.get("RANK", 0)); world = int(os.environ.get("WORLD_SIZE", 1))
     local = int(os.environ.get("LOCAL_RANK", 0)); r0 = rank == 0
     if world > 1:
-        torch.cuda.set_device(local)                                           # BEFORE init: pins this rank to its GPU
+        torch.cuda.set_device(local)
         dist.init_process_group("nccl", timeout=timedelta(hours=4), device_id=torch.device(f"cuda:{local}"))
     dev = torch.device(f"cuda:{local}")
     os.makedirs(CKDIR, exist_ok=True)
@@ -364,15 +313,15 @@ def main():
     for p in model.parameters(): p.requires_grad = False
     for n, p in model.named_parameters():
         if ".A" in n or ".B" in n: p.requires_grad = True
-    # scF stats over the TRAIN split only (val cells stay out of the input statistics). Split-aware cache path so a
-    # val run never silently reuses the all-cell stats; --scf_stats <old path> opts back in and skips the 147 GB pass.
+
+
     stats_path = args.scf_stats or (f"{V2}/scf_stats.npz" if args.val_frac <= 0 else
                                     f"{V2}/scf_stats_train_vf{args.val_frac:g}_{args.val_side}.npz")
     mu, sd = scf_stats_cached(ds, stats_path, r0, world)
     he_tower = HeTower().to(dev); scf_tower = ScfTower(mu, sd).to(dev)
 
-    if r0:                                                                     # GATES — abort on failure
-        ok1 = gate_memmap_lossless(samples, model, dev)                        # LoRA B=0 here => frozen backbone
+    if r0:
+        ok1 = gate_memmap_lossless(samples, model, dev)
         ok2 = gate_gradcache(model, he_tower, scf_tower, ds, dev)
         if not (ok1 and ok2):
             print("[ABORT] a gate failed — refusing to train", flush=True)
@@ -381,16 +330,16 @@ def main():
     if args.smoke:
         if r0: print("[smoke] gates + split passed; not training.", flush=True)
         return
-    if world > 1:                                                              # identical init on every rank
+    if world > 1:
         for p in list(model.parameters()) + list(he_tower.parameters()) + list(scf_tower.parameters()):
             dist.broadcast(p.data, 0)
 
-    # ---- fixed val batches (seeded subset, then sharded by rank so every rank scores whole batches) ----
+
     val_dl = None
     if args.val_frac > 0 and len(val_ds) >= args.val_batch:
         nb = min(args.val_batches, len(val_ds) // args.val_batch)
         pick = np.random.RandomState(1234).permutation(len(val_ds))[:nb * args.val_batch]
-        pick = pick.reshape(nb, args.val_batch)[rank::world].reshape(-1)        # whole batches per rank
+        pick = pick.reshape(nb, args.val_batch)[rank::world].reshape(-1)
         if len(pick):
             val_dl = DataLoader(val_ds, batch_size=args.val_batch, sampler=pick.tolist(), drop_last=True,
                                 num_workers=args.val_workers, pin_memory=True,
@@ -442,9 +391,7 @@ def main():
                               extra=dict(step=step, val_infonce=vl, val_r1_he2scf=r_ig, val_r1_scf2he=r_gi))
         if world > 1: dist.barrier()
 
-    # Resume lands mid-epoch. We must NOT re-iterate the epoch from batch 0, and must NOT "iterate and continue"
-    # (the DataLoader still materialises every skipped batch: ~1.5 TB of reads here). Instead: take THIS rank's
-    # deterministic index order for epoch ep0 and slice off the already-done prefix — zero skipped reads.
+
     skip = max(step0 - ep0 * spe, 0)
     if r0 and skip: print(f"[resume] fast-skip {skip} done batches of epoch {ep0} via sampler offset (0 data read)", flush=True)
     if not args.no_val_at_start: do_val("start")
@@ -452,18 +399,18 @@ def main():
         if sampler: sampler.set_epoch(ep)
         epoch_dl, iterskip = dl, 0
         if ep == ep0 and skip > 0:
-            if sampler is not None:                                        # world>1: slice the sharded index order
+            if sampler is not None:
                 order = list(iter(sampler))[skip * per_rank:]
                 epoch_dl = DataLoader(ds, batch_size=per_rank, sampler=order, drop_last=True,
                                       num_workers=args.workers, pin_memory=True, persistent_workers=False,
                                       prefetch_factor=4 if args.workers else None)
             else:
-                iterskip = skip                                            # world==1 fallback (not our config)
+                iterskip = skip
         for bi, (img, W, scf) in enumerate(epoch_dl):
             if bi < iterskip: continue
             for g, base in zip(opt.param_groups, (args.lr_lora, args.lr_tower)):
                 g["lr"] = base * min(1.0, (step + 1) / max(args.warmup, 1))
-            while True:                                                        # OOM -> halve the chunk and retry
+            while True:
                 try:
                     chunks = [(img[i:i + ch], W[i:i + ch], scf[i:i + ch]) for i in range(0, len(img), ch)]
                     loss = gradcache_step(chunks, model, he_tower, scf_tower, opt, dev, world)
@@ -481,8 +428,8 @@ def main():
             if args.val_every > 0 and step % args.val_every == 0: do_val("periodic")
             if r0 and step % args.save_every == 0:
                 save_ckpt(latest, step, ep, model, he_tower, scf_tower, opt, args, best_val)
-        do_val(f"epoch{ep}-end")                                               # every rank (collective inside)
-        if r0:                                                                 # ★ EVERY epoch, permanent, never overwritten
+        do_val(f"epoch{ep}-end")
+        if r0:
             save_artifact(f"{CKDIR}/clip_lora_{args.tag}_epoch{ep}.pt", model, he_tower, scf_tower, mu, sd, args,
                           meta=f"v3 LoRA-CLIP epoch {ep} ({len(ds):,} cells, world={world})",
                           extra=dict(epoch_index=ep, step=step))

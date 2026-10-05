@@ -1,23 +1,7 @@
-# VOICE — every environment-dependent path. Edit this file, or export VOICE_<KEY> to override any entry.
-# Resolution order is: environment variable > this file > built-in default.
-# Only the settings your entry point needs have to be filled in (see voice/paths.py for the per-entry-point list).
-
 paths:
-  # --- needed by predict/ ---
-  # HuggingFace cache containing MahmoodLab/UNI2-h. UNI2-h is GATED: request access on the model page, then
-  #   huggingface-cli download MahmoodLab/UNI2-h
   hf_home: null
-  # Released VOICE weights: a directory holding stage1.safetensors + stage2.safetensors + config.json
   ckpt_dir: null
-
-  # --- additionally needed to TRAIN ---
-  # <dataset>/<slide>/{manifest.csv.gz, patch_cell_boundaries.npz, patches/}
   data_root: null
-  # precomputed scFoundation cell embeddings (Phase-1 contrastive targets only; Phase-2 does not need them)
   scf_dir: null
-  # sample_meta/<slide>/ : per-slide expression + coordinates
   v2_root: null
-
-  # --- additionally needed to run benchmark/ ---
-  # test_preprocessed/<group>/<slide>/{expression.npz, patch_cell_boundaries.npz, genes.tsv, manifest.csv.gz}
   testset_root: null

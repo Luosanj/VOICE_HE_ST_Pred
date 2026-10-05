@@ -1,35 +1,5 @@
 #!/usr/bin/env python
-"""ScaleHE2Cell: encoder features -> SE(2) decoder -> negative-binomial head, and its training loop.
-Imports his model.py / model_plus.py verbatim (experiment.md §9: build on his code, don't reimplement).
-Global 11251-gene head; per-patch loss masked to the slide's panel. Metric = his log1p(raw) per-gene PCC.
-
-🔴 FIXED 2026-07-12 — TEST-SET SELECTION LEAK (see results_2026-07-12.md §R.5, memory he2gene-scaletrain-selection-leak).
-   The old code did `val_slides = held_slides` and kept the BEST-VAL checkpoint => it selected the checkpoint by PCC on
-   the 5 held-out BENCHMARK (test) slides. `scaleA_real_base.pt` is that artefact: step 600k of a planned 1.5M, chosen
-   as the argmax over ~15 evaluations. Its zero-shot score was the SELECTION CRITERION, not a measurement — worth
-   +0.055/+0.056 ALL on rep1/rep2 and ~0 elsewhere. Every "vs baseline-A" comparison inherited the advantage.
-   NOW: --held_slides is TEST (never trained on, never selected on). --val_slides is a separate set of WHOLE slides
-   carved out of the TRAIN pool and is the ONLY thing selection may look at. Omit --val_slides => NO selection at all
-   (last-step only). Comparability rule: apply the SAME procedure to every model you compare.
-
-⚠️ CHOOSING --val_slides: the failure mode this must catch is CROSS-SLIDE / CROSS-DOMAIN degradation (continued training
-   silently destroys zero-shot on off-platform slides). So the val set must be WHOLE SLIDES (a cell-level split inside a
-   training slide cannot see it — the model keeps improving there while collapsing on new slides), and it should carry
-   whatever DOMAIN diversity you can afford. In this cache the train pool is 24 slides = 23 Xenium_V1 + exactly ONE
-   Xenium_Prime, so that Prime slide is the ONLY cross-platform signal available.
-   Recommended (keeps every tissue represented in train; tissues with >=2 slides give one up):
-     --val_slides prostate_prostate_prime_ffpe_xenium_Xenium_Prime_Human_Prostate_FFPE,\
-kidney_kidney_preview_xenium_Xenium_V1_hKidney_cancer_section,\
-liver_liver_xenium_Xenium_V1_hLiver_cancer_section_FFPE,\
-breast_cancer_sample7_xenium_Xenium_V1_FFPE_Human_Breast_ILC
-   CAVEAT (be honest in the paper): Xenium_Prime != the Xenium_FFPE original release that rep1/rep2 come from, so this
-   val is a PROXY OOD detector, not a guarantee. Also report the unselected last-step (*_final.pt) row alongside the
-   selected one; if a conclusion flips between them, say so.
-
-Outputs: scaleA<tag>.pt = best-VAL (only if --val_slides given) · scaleA<tag>_latest.pt / _final.pt = UNSELECTED last step.
-
-Run:  python scale_train.py --held_slides <test slides> --val_slides <train-pool slides> [--monitor_held] [--max_steps N]
-"""
+"""Decode cell features and train expression prediction. Input: features, coordinates, counts, and gene panels. Output: log1p predictions and decoder checkpoints."""
 from __future__ import annotations
 import argparse, os, sys, time, math
 import numpy as np
@@ -41,7 +11,7 @@ from voice.genes import GeneSpace
 from voice.cache_io import SourceCache
 from voice.scale_dataset import GlobalSpatialDataset
 
-# SE(2)-equivariant decoder and NB head: see voice/_se2_arch.py / voice/_nb_head.py for provenance.
+
 from voice._se2_arch import UNIEncoder, SE2Transformer
 from voice._nb_head import NBHead
 
@@ -56,7 +26,7 @@ class ScaleHE2Cell(nn.Module):
     def forward(self, feats, pos):
         x = self.encoder(feats)
         h = self.se2(x, pos)
-        return self.head(h)                              # log1p(mu), {mu, log_theta}
+        return self.head(h)
 
 
 def nb_nll(y, mu, theta):
@@ -65,7 +35,7 @@ def nb_nll(y, mu, theta):
              + t * (torch.log(t) - torch.log(t + mu)) + y * (torch.log(mu + 1e-8) - torch.log(t + mu))).mean()
 
 
-def per_gene_pcc(P, Y):                                  # P,Y: [N,G] log1p; PCC per gene over cells
+def per_gene_pcc(P, Y):
     out = np.full(P.shape[1], np.nan)
     for g in range(P.shape[1]):
         a, b = P[:, g], Y[:, g]
@@ -95,7 +65,7 @@ def evaluate(model, val_ds, device):
     for i in range(len(val_ds)):
         b = val_ds[i]; si = b["slide"]
         lm, _ = model(b["features"].to(device), b["pos"].to(device))
-        lm = lm[:, val_ds.slide_panel[si]].float().cpu().numpy()      # [n, Gp] on panel
+        lm = lm[:, val_ds.slide_panel[si]].float().cpu().numpy()
         ci = b["cell_idx"].numpy()
         n = val_ds.slide_feats[si].shape[0]; Gp = lm.shape[1]
         if acc[si]["sum"] is None:
@@ -142,10 +112,10 @@ def main():
     gs = GeneSpace(cfg.paths.global_genes, cfg.scfoundation.gene_index_tsv, cfg.paths.panels_dir, universe="all")
     src = SourceCache(cfg)
     all_slides = [(t, s) for (t, s, _p, _n) in src.list_slides()]
-    # ---- LEAK-FREE SPLIT (fixed 2026-07-12). TEST is never trained on AND never selected on. ----
+
     known = {s for (_t, s) in all_slides}
-    held = set(args.held_slides.split(","))                                  # TEST
-    val = set(args.val_slides.split(",")) if args.val_slides else set()      # SELECTION set (from the TRAIN pool)
+    held = set(args.held_slides.split(","))
+    val = set(args.val_slides.split(",")) if args.val_slides else set()
     if val & held:
         raise SystemExit(f"[LEAK] --val_slides overlaps --held_slides: {sorted(val & held)}. "
                          f"Selecting on the test slides is exactly the bug this fix removes.")
@@ -196,7 +166,7 @@ def main():
         b = train_ds[order[ptr]]; ptr += 1
         model.train()
         lm, aux = model(b["features"].to(dev), b["pos"].to(dev))
-        panel = b["panel"].to(dev); y = b["y_counts"].to(dev)            # [n,Gp] raw
+        panel = b["panel"].to(dev); y = b["y_counts"].to(dev)
         lmp = lm[:, panel]; mup = aux["mu"][:, panel]; thp = aux["log_theta"][panel].exp()
         loss = F.mse_loss(lmp, torch.log1p(y)) + 0.5 * nb_nll(y, mup, thp)
         opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
@@ -205,22 +175,22 @@ def main():
         if (step + 1) % args.eval_every == 0 or step + 1 == args.max_steps:
             blob = {"model": model.state_dict(), "n_genes": gs.n_global, "args": vars(args),
                     "step": step + 1, "opt": opt.state_dict(), "val": None}
-            if val_ds is not None:                                   # ---- SELECTION: on the VAL slides ONLY ----
+            if val_ds is not None:
                 m = evaluate(model, val_ds, dev)
                 ps = " | ".join(f"{n[:18]} {a:.4f}/{h:.4f}/{s:.4f}" for n, a, h, s in m.get("per_slide", []))
                 print(f"  [VAL @ {step+1}] macro ALL={m['ALL']:.4f} HVG50={m['HVG50']:.4f} SVG50={m['SVG50']:.4f} || {ps}", flush=True)
                 blob["val"] = m
-            torch.save(blob, ckpt.replace(".pt", "_latest.pt"))      # ALWAYS: the UNSELECTED last step
+            torch.save(blob, ckpt.replace(".pt", "_latest.pt"))
             if val_ds is not None and blob["val"]["ALL"] > best:
-                best = blob["val"]["ALL"]; torch.save(blob, ckpt)    # best-VAL (leak-free selection)
-            if test_ds is not None:                                  # ---- MONITOR ONLY: never touches selection ----
+                best = blob["val"]["ALL"]; torch.save(blob, ckpt)
+            if test_ds is not None:
                 mt = evaluate(model, test_ds, dev)
                 pt = " | ".join(f"{n[:18]} {a:.4f}" for n, a, _h, _s in mt.get("per_slide", []))
                 print(f"  [TEST-MONITOR @ {step+1}] macro ALL={mt['ALL']:.4f} || {pt}"
                       f"   *** DIAGNOSTIC ONLY — NOT used to pick any checkpoint ***", flush=True)
     torch.save({"model": model.state_dict(), "n_genes": gs.n_global, "args": vars(args),
                 "step": args.max_steps, "opt": opt.state_dict(), "val": None},
-               ckpt.replace(".pt", "_final.pt"))                     # explicit, unambiguous last-step ckpt
+               ckpt.replace(".pt", "_final.pt"))
     if val_ds is not None:
         print(f"done {time.time()-t0:.0f}s | best VAL PCC_ALL={best:.4f} -> {ckpt} | last-step -> {ckpt.replace('.pt','_final.pt')}")
     else:

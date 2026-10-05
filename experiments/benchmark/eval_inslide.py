@@ -1,32 +1,16 @@
 #!/usr/bin/env python
-"""In-slide evaluation: five-fold cross-validation within a single slide.
-
-    python benchmark/eval_inslide.py --slides slides.yaml --global_genes genes.tsv --out results.csv
-
-This is the protocol most prior work reports, so it is here for comparability -- but read what it measures. The
-slide is cut into five contiguous vertical bands. For each fold, the gene head is fine-tuned on four bands and
-predicts the fifth; the five held-out band predictions are pooled and per-gene correlation is computed once over
-the whole slide. Bands, not random cells: neighbouring cells share tissue and a random split would put the same
-structure on both sides.
-
-The LoRA encoder is NOT trained here. The 1536-d features are extracted once per slide and only the SE(2)
-decoder and NB head are fitted per fold, which is what makes five folds affordable.
-
-**In-slide numbers are not zero-shot.** Part of the target slide is in training for every fold, so they are
-systematically higher than the cross-slide numbers and the two must never be pooled. If you only report one,
-report cross-slide.
-"""
+"""Evaluate spatial five-fold prediction. Input: paired slide data and trained encoder weights. Output: PCC CSV and out-of-fold predictions."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 import numpy as np, pandas as pd
 from voice import paths as _p
 _p.hf_home()
 import torch
 from torch.utils.data import DataLoader
 
-from benchmark.dataset import load_slides
-from benchmark.runner import load_model, gene_orders
+from experiments.benchmark.dataset import load_slides
+from experiments.benchmark.runner import load_model, gene_orders
 from voice.encoder import pooled_feat, MEAN, STD
 from voice.scale_train import ScaleHE2Cell, nb_nll
 from voice.metrics_bench import score_against_head, rank_hvg_svg

@@ -1,26 +1,12 @@
 #!/usr/bin/env python
-"""Cross-slide evaluation: apply a trained model to slides it has never seen, and score it.
-
-    python benchmark/eval_crossslide.py --slides slides.yaml --gene_lists gene_lists/ --out results.csv
-
-Nothing on the test slide is fitted -- no fold, no refit, no calibration. Each slide's cells are grouped into
-non-overlapping 256-px tiles so every cell is predicted exactly once with its neighbours as context, and scored
-against its own measured expression.
-
-A panel gene the model's head cannot emit takes a correlation of 0 and stays in the denominator, so the number
-is comparable between methods with different output spaces.
-
-`--gene_lists` is optional. With it, HVG/SVG use the canonical model-independent lists from
-benchmark/gene_lists.py -- required if you are comparing several methods. Without it the rankings are derived
-from the slide's own measured expression, which is fine for a single model.
-"""
+"""Evaluate unseen slides. Input: paired benchmark slides, trained weights, and canonical gene lists. Output: PCC CSV and optional prediction files."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 import numpy as np, pandas as pd
 
-from benchmark.dataset import load_slides
-from benchmark.runner import load_model, predict_slide, gene_orders
+from experiments.benchmark.dataset import load_slides
+from experiments.benchmark.runner import load_model, predict_slide, gene_orders
 from voice.metrics_bench import score_against_head, rank_hvg_svg
 from voice.panel import sym2glob_map
 
@@ -32,7 +18,7 @@ def main():
     ap.add_argument("--slides", required=True)
     ap.add_argument("--global_genes", required=True,
                     help="TSV (gene_symbol, global_gene_index) for the head -- released with the weights")
-    ap.add_argument("--gene_lists", default=None, help="dir from benchmark/gene_lists.py")
+    ap.add_argument("--gene_lists", default=None, help="dir from experiments/benchmark/gene_lists.py")
     ap.add_argument("--out", default="results_crossslide.csv")
     ap.add_argument("--stage1", default=None); ap.add_argument("--stage2", default=None)
     ap.add_argument("--save_preds", default=None, help="dir to write per-slide predictions for figures / retrieval")
@@ -55,7 +41,7 @@ def main():
         if a.gene_lists:
             f = os.path.join(a.gene_lists, f"{sl.name}.tsv")
             if not os.path.exists(f):
-                sys.exit(f"{sl.name}: no canonical gene list at {f}. Run benchmark/gene_lists.py first, or drop "
+                sys.exit(f"{sl.name}: no canonical gene list at {f}. Run experiments/benchmark/gene_lists.py first, or drop "
                          f"--gene_lists to rank from this slide's own expression.")
             hvg, svg = gene_orders(f, genes)
         else:

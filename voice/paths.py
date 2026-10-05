@@ -1,21 +1,4 @@
-"""Every environment-dependent path in one place.
-
-Nothing else in this package may contain an absolute path. Resolution order for each setting is
-
-    1. an environment variable  (VOICE_HF_HOME, VOICE_DATA_ROOT, ...)
-    2. configs/default.yaml     (or the file named by VOICE_CONFIG)
-    3. the built-in default, if the setting has one
-
-A setting that is required by the code path you are running but never set raises a message naming the variable
-and what it is for, rather than failing later inside a loader with an unhelpful FileNotFoundError.
-
-Which settings a given entry point actually needs:
-
-    predict/          HF_HOME, CKPT_DIR                      (no training data, no scFoundation)
-    train_phase1.py   HF_HOME, DATA_ROOT, SCF_DIR, CKPT_DIR, V2_ROOT
-    train_phase2.py   HF_HOME, DATA_ROOT, CKPT_DIR, V2_ROOT
-    benchmark/        HF_HOME, CKPT_DIR, TESTSET_ROOT
-"""
+"""Resolve data and model paths. Input: VOICE_* environment variables or YAML configuration. Output: paths and HuggingFace cache settings."""
 from __future__ import annotations
 import os
 from pathlib import Path
@@ -48,7 +31,7 @@ _WHY = {
     "DATA_ROOT":    "training corpus root: <dataset>/<slide>/{manifest.csv.gz, patch_cell_boundaries.npz, patches/}",
     "SCF_DIR":      "precomputed scFoundation cell embeddings, Phase-1 contrastive targets only",
     "V2_ROOT":      "per-slide metadata + expression used by training (sample_meta/<slide>/)",
-    "TESTSET_ROOT": "preprocessed benchmark slides used by benchmark/ (test_preprocessed/<group>/<slide>/)",
+    "TESTSET_ROOT": "preprocessed benchmark slides used by experiments/benchmark/ (test_preprocessed/<group>/<slide>/)",
 }
 
 

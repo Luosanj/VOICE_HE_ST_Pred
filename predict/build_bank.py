@@ -1,30 +1,5 @@
 #!/usr/bin/env python
-"""Build a retrieval bank from reference slides that have measured expression.
-
-    python predict/build_bank.py --release weights/voice-23m --bank_dir bank/lung \\
-        --prepared /data/ref/lung_a /data/ref/lung_b
-
-A bank slide is one reference slide's cells: their embeddings, their measured log1p expression, their
-coordinates, and the global ids of the genes the slide's panel measures. Retrieval then finds, for a query
-cell, the bank cells that look like it, and averages what they were actually expressing (`voice/retrieval.py`).
-
-**Reference slides must be the same tissue as the query and must not include the query slide.** A bank
-containing the target is self-retrieval: it finds the cell itself and reports its own label, which looks
-excellent and means nothing.
-
-**The bank must be embedded with the weights the query will use.** Different weights put query and bank in
-different spaces, and the neighbours stop corresponding to anything; the encoder identity is stored in each
-bank file and checked at retrieval time.
-
-Both input layouts work, the same as `predict/predict.py`:
-
-    --prepared DIR [DIR ...]      prepared slides, each needing an expression.npz + genes.tsv alongside
-    --image IMG --cells NPZ --expression NPZ --genes TSV      one slide from a whole-slide image
-
-Size: one slide of N cells costs about `N x 1536 x 4` bytes of embeddings plus its expression, so a
-half-million-cell slide is roughly 3 GB compressed. That is why the bank is written per slide and read back one
-signature group at a time.
-"""
+"""Build a reference-cell bank. Input: prepared slides with measured expression and model weights. Output: per-slide .bank.npz files."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -65,7 +40,7 @@ def slide_expression(directory, sym2glob):
     cols = np.where(mask)[0]
     names = [genes[i] for i in cols]
     gid = np.array([sym2glob.get(n, -1) for n in names], np.int64)
-    keep = gid >= 0                                   # a gene outside the head cannot be a retrieval target
+    keep = gid >= 0
     Y = np.log1p(np.asarray(X[:, cols[keep]].todense(), np.float32))
     return Y, gid[keep], int(n_prot), int((~keep).sum())
 
@@ -119,6 +94,7 @@ def main():
         if kind == "prepared":
             src = open_slide(prepared=d, mpp=a.mpp)
             Y, panel, n_prot, n_out = slide_expression(d, sym2glob)
+            Y = Y[src.er]
         else:
             src = open_slide(image=a.image, cells=a.cells, mpp=a.mpp)
             tmp = pathlib.Path(a.expression).parent

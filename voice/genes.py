@@ -1,15 +1,4 @@
-"""Gene-space bookkeeping.
-
-Three gene namespaces exist and must be kept aligned:
-  - global : the 11251-gene union over all panels (expr CSR columns).        index = global_gene_index
-  - scF    : scFoundation's 19264-gene vocabulary.                           index = scf_id
-  - panel  : the genes a given Xenium panel actually measures (a subset).
-
-Spec invariant §8.1: everything indexed by gene flows through gene_emb. A gene is "modelable"
-only if it has a gene_emb, i.e. it exists in the foundation model's vocab. With
-`universe='scf_vocab'` we restrict every gene set to global genes that map into scF; genes
-without an embedding are dropped (and counted) rather than silently given a free parameter.
-"""
+"""Map gene identifiers across panels. Input: global genes, scFoundation vocabulary, and panel files. Output: aligned gene indices."""
 from __future__ import annotations
 import os
 import numpy as np
@@ -19,25 +8,25 @@ import pandas as pd
 class GeneSpace:
     def __init__(self, global_genes_tsv, scf_gene_index_tsv, panels_dir, universe="scf_vocab"):
         g = pd.read_csv(global_genes_tsv, sep="\t").sort_values("global_gene_index")
-        self.global_symbols = g["gene_symbol"].tolist()                 # global_idx -> symbol
+        self.global_symbols = g["gene_symbol"].tolist()
         self.n_global = len(self.global_symbols)
         self.symbol_to_global = {s: i for i, s in enumerate(self.global_symbols)}
 
-        s = pd.read_csv(scf_gene_index_tsv, sep="\t")                    # columns: gene_name, index
+        s = pd.read_csv(scf_gene_index_tsv, sep="\t")
         self.scf_symbol_to_id = {sym: int(idx) for sym, idx in zip(s["gene_name"], s["index"])}
         self.n_scf = len(self.scf_symbol_to_id)
 
-        # global -> scf id, or -1 when the symbol is absent from the foundation vocab
+
         self.global_to_scf = np.full(self.n_global, -1, dtype=np.int64)
         for i, sym in enumerate(self.global_symbols):
             self.global_to_scf[i] = self.scf_symbol_to_id.get(sym, -1)
-        self.has_emb = self.global_to_scf >= 0                          # bool[n_global]
+        self.has_emb = self.global_to_scf >= 0
 
         self.universe = universe
         self.panels_dir = panels_dir
         self._panel_cache: dict[str, np.ndarray] = {}
 
-    # ---- panel handling ----
+
     def panel_global_ids(self, panel_id) -> np.ndarray:
         """Global indices measured by `panel_id`, restricted to the modelable universe, sorted."""
         if panel_id in self._panel_cache:
@@ -59,7 +48,7 @@ class GeneSpace:
         return {"panel_id": panel_id, "n_panel": int(n_panel), "in_global": int(in_global),
                 "modelable": int(modelable), "dropped_no_emb": int(in_global - modelable)}
 
-    # ---- mapping into the foundation vocab ----
+
     def scf_ids_for_globals(self, global_ids) -> np.ndarray:
         """scF vocab ids for the given global indices. All >=0 when universe='scf_vocab'."""
         return self.global_to_scf[np.asarray(global_ids)]

@@ -1,180 +1,82 @@
 # VOICE
 
-Predicting single-cell gene expression from H&E.
+Predict single-cell gene expression from H&E with UNI2-h, a spatial decoder, and reference-cell retrieval.
 
-VOICE is a three-stage model. **Stage 1** adapts a pathology foundation encoder (UNI2-h) with LoRA and aligns
-each cell's image to a single-cell expression embedding by contrastive learning. **Stage 2** decodes that
-representation with an SE(2)-equivariant transformer over the cell's spatial neighbourhood and a
-negative-binomial head, giving expression for a 6,029-gene panel. **Stage 3** fuses this direct prediction with a
-retrieval prediction using a per-gene weight fitted on reference slides and transferred to the target.
-
-This repository contains the training code, an inference entry point for your own H&E, and the benchmark code.
-
-## Install
+## Setup
 
 ```bash
-git clone <this repo> && cd voice
 pip install -r requirements.txt
 ```
 
-UNI2-h is a **gated** model: request access at `huggingface.co/MahmoodLab/UNI2-h`, then
+For `predict/segment.py`, also install `cellpose>=4.0` and `opencv-python-headless`. SVS/NDPI/MRXS inputs require OpenSlide and `openslide-python`.
+
+UNI2-h access and weights: [MahmoodLab/UNI2-h](https://huggingface.co/MahmoodLab/UNI2-h).
+Set paths in `configs/default.yaml` or `VOICE_*` environment variables. See [training inputs](#training-and-evaluation) and [model weights](weights/README.md).
+
+## Prediction
+
+Input: a prepared slide with cell crop images, `manifest.csv.gz` (`expr_row`, `patch_path`), and `patch_cell_boundaries.npz` (`expr_rows`, `indptr`, `vertex_x_patch`, `vertex_y_patch`, `x_pixel`, `y_pixel`, `output_size`). Coordinates are `(y,x)` in source pixels; polygons are in crop pixels.
+
+Measured expression, when required, is `expression.npz` (scipy CSR raw counts) with columns listed in `genes.tsv`. RNA/protein panels use vendor `features.h5` for channel filtering.
 
 ```bash
-huggingface-cli download MahmoodLab/UNI2-h
+python predict/predict.py --prepared /data/target --release /models/voice-23m \
+  --out pred.h5ad --save_embeddings
 ```
 
-Fill in `configs/default.yaml` (or export `VOICE_HF_HOME`, `VOICE_CKPT_DIR`, ...). Only the entries your entry
-point needs have to be set; `voice/paths.py` lists which those are and errors with the variable name if one is
-missing.
-
-## Predict
-
-Point `--release` at a model directory (see `weights/README.md`). There are two ways to give it a slide.
-
-**A whole-slide image.** Segment the nuclei, then predict:
+For a whole-slide image, supply cell polygons in the same pixel coordinate system and image resolution:
 
 ```bash
-python predict/segment.py --image slide.svs --out cells.npz --mpp 0.25
+python predict/segment.py --image slide.svs --mpp 0.25 --out cells.npz
 python predict/predict.py --image slide.svs --cells cells.npz --mpp 0.25 \
-    --release weights/voice-23m --out pred.h5ad --save_embeddings
+  --release /models/voice-23m --out pred.h5ad
 ```
 
-**A slide already prepared in the corpus layout** — `patch_cell_boundaries.npz` + `manifest.csv.gz` +
-`patches/`, which is what the training and benchmark data look like:
+Whole-slide crops cover 55 µm and are resized to 224×224. Prepared crops must already use this field of view.
+
+Output: AnnData `X` with direct log1p predictions or fused gene scores, `obsm["spatial"]` with coordinates, and optional `obsm["X_voice"]` with 1536-dimensional cell features.
+
+## Retrieval and fusion
+
+Input: same-tissue reference slides with measured `expression.npz` and `genes.tsv`; model weights must match the query. Exclude the target and its duplicate sections from references. Genes without retrieval or fitted weights use the direct branch.
 
 ```bash
-python predict/predict.py --prepared /data/slides/my_slide \
-    --release weights/voice-23m --out pred.h5ad --save_embeddings
+python predict/build_bank.py --release /models/voice-23m --bank_dir bank/lung \
+  --global_genes /models/voice-23m/genes.tsv --prepared /data/lung_a /data/lung_b
+python experiments/benchmark/fit_gate.py --release /models/voice-23m --bank bank/lung \
+  --prepared /data/lung_a /data/lung_b --out gate_lung.json
+python predict/predict.py --prepared /data/target --release /models/voice-23m \
+  --bank bank/lung --gate gate_lung.json --out pred.h5ad
 ```
 
-The prepared path needs no `--mpp`: the crops were cut at the right physical size when the slide was built and
-the polygons are already in crop coordinates. It is also exactly reproducible — the same PNG bytes reach the
-encoder every run. `predict/inputs.py` documents both layouts.
+Output: reference bank files, per-gene beta JSON, and AnnData with direct/retrieval layers, beta, and fused `X`. Retrieval uses K=200, tau=0.03, and per-slide standardized log1p reference expression. Fused values are gene-wise scores.
 
-Output is an AnnData: `X = log1p(mu)` over the model's gene head, `obsm["spatial"]` = cell centroids.
+## Training and evaluation
 
-### Embeddings, for downstream tasks
+| Path setting | Input/output |
+| --- | --- |
+| `VOICE_HF_HOME` | UNI2-h HuggingFace cache |
+| `VOICE_CKPT_DIR` | Stage-2 checkpoint output |
+| `VOICE_DATA_ROOT` | Prepared-slide corpus |
+| `VOICE_SCF_DIR` | scFoundation cell embeddings |
+| `VOICE_V2_ROOT` | Training cache |
 
-`--save_embeddings` adds `obsm["X_voice"]`, the 1536-d per-cell feature the gene head reads from. **That is the
-representation to use for cell-type classification, clustering or integration** — not the 6029 predicted genes,
-which are a lossy view of the same vector. `--embeddings_only` skips the gene head altogether.
+Training cache: `manifest_v2.csv`, `global_genes_v2.tsv`, `crops_raw/<slide>/{crops.u8.npy,maskW.f16.npy}`, `cell_emb_scf/<slide>/scf.f16.npy`, and `sample_meta/<slide>/` with expression, genes, positions, and boundaries. These indices describe user-provided files.
 
-```python
-import scanpy as sc
-a = sc.read_h5ad("pred.h5ad")
-sc.pp.neighbors(a, use_rep="X_voice")
-sc.tl.leiden(a)                     # or train a classifier on a.obsm["X_voice"]
-```
-
-### Two things decide whether the numbers are meaningful
-
-*Resolution* (whole-slide path only). The model sees a fixed **physical** field of view of about 42.7 µm per
-cell — 201 px at the Xenium morphology resolution of 0.2125 µm/px. Pass `--mpp` and the crop is rescaled to
-match. Getting this wrong does not raise an error; it shows the model a different amount of tissue and the
-predictions degrade quietly.
-
-*Cell boundaries.* The per-cell feature is a **mask-weighted** average over the encoder's 256 patch tokens, so
-the boundary decides which image evidence is attributed to this cell rather than its neighbours. Without
-polygons the mask falls back to the centre token, which works but is measurably worse. If you have
-segmentations from your own pipeline, write them into `cells.npz` and skip `segment.py`.
-
-### Stage 3: retrieval and the per-gene gate
-
-The direct branch predicts from the image alone. The retrieval branch asks a different question — which cells
-in a reference cohort look like this one, and what were they expressing — and averages their measured profiles.
-The gate fuses them per gene, `pred_g = beta_g * A_g + (1 - beta_g) * R_g`.
-
-Stage 3 needs reference slides **of the same tissue that have measured expression**, so it is optional: a slide
-with no reference cohort still gets the direct branch.
+Arrays share expression-row order: crops are uint8 `[N,224,224,3]`, masks are normalized `[N,16,16]`, and scFoundation features are `[N,3072]`. Crops cover 55 µm.
 
 ```bash
-# 1. embed the reference slides into a bank
-python predict/build_bank.py --release weights/voice-23m --bank_dir bank/lung \
-    --global_genes weights/voice-23m/genes.tsv --prepared /data/ref/lung_a /data/ref/lung_b
-
-# 2. fit the gate on those references (each is retrieved from a bank that EXCLUDES itself)
-python benchmark/fit_gate.py --release weights/voice-23m --bank bank/lung \
-    --prepared /data/ref/lung_a /data/ref/lung_b --out gate_lung.json
-
-# 3. predict with both
-python predict/predict.py --prepared /data/slides/target --release weights/voice-23m \
-    --bank bank/lung --gate gate_lung.json --out pred.h5ad
+bash train/run_phase1.sh
+LORA_CKPT=/models/stage1.pt bash train/run_phase2.sh
+python experiments/benchmark/gene_lists.py --slides slides.yaml --out gene_lists/
+python experiments/benchmark/eval_crossslide.py --slides slides.yaml --global_genes genes.tsv \
+  --gene_lists gene_lists/ --save_preds predictions/ --out crossslide.csv
+python experiments/benchmark/eval_inslide.py --slides slides.yaml --global_genes genes.tsv --out inslide.csv
 ```
 
-The output then carries `layers["A"]` (direct), `layers["R"]` (retrieval, NaN where no reference measures the
-gene), `var["beta"]`, and `X` = the fusion.
+Stage 1 writes `VOICE_V2_ROOT/ckpts/clip_lora_<tag>_*`; Stage 2 writes `VOICE_CKPT_DIR/se2_lora_<tag>_*`. Set `NPROC`, `TAG`, and other script variables for your run. Evaluation writes all-gene and HVG/SVG PCC tables. In-slide evaluation uses spatial five-fold fitting; cross-slide evaluation applies fixed weights.
 
-Two rules the code enforces rather than trusts you to remember. The bank must **not contain the target** —
-retrieving a slide from a bank that includes it finds the cell itself and reports its own label. And the bank
-must be embedded with the **same weights** as the query, or query and bank sit in different spaces and the
-neighbours mean nothing; the encoder identity is stored in each bank file and checked.
-
-Where beta is fitted is the whole point: fitting it on the target needs the labels being predicted, which is an
-oracle, not a method. `benchmark/fit_gate.py` fits on references and transfers.
-
-## Train
-
-```bash
-bash train/run_phase1.sh     # contrastive, 2 GPU
-bash train/run_phase2.sh     # gene supervision, 3 GPU
-```
-
-Both scripts hard-code the hyper-parameters the released models were actually trained with. Both hold out a
-spatial band per slide with a margin, so a Phase-2 run inherits a Phase-1 backbone that never saw the validation
-region either. See `docs/training.md` for the split rule, the resume behaviour and the smoke tests.
-
-Phase 1 needs precomputed scFoundation cell embeddings as its contrastive target; Phase 2 and inference do not.
-
-## Benchmark
-
-`benchmark/` runs the paper's evaluations **on slides you supply**. A benchmark slide is an H&E image paired
-with a spatial assay on the same tissue; `benchmark/dataset.py` documents the four files that make one, and
-describes them in a small YAML:
-
-```yaml
-slides:
-  - name: my_breast_slide
-    dir:  /data/benchmark/my_breast_slide
-    mpp:  0.25
-```
-
-```bash
-python benchmark/gene_lists.py     --slides slides.yaml --out gene_lists/
-python benchmark/eval_crossslide.py --slides slides.yaml --global_genes genes.tsv \
-                                    --gene_lists gene_lists/ --save_preds preds/ --out cross.csv
-python benchmark/eval_inslide.py   --slides slides.yaml --global_genes genes.tsv --out inslide.csv
-
-python benchmark/figures/spatial_heatmap.py --preds preds/my_breast_slide.npz --gene ACTA2 --out heat.png
-python benchmark/figures/pcc_boxplot.py     --preds VOICE=preds/my_breast_slide.npz --out box.png
-```
-
-- `gene_lists.py` builds the canonical, model-independent HVG/SVG lists a slide is scored on — same genes for
-  every method being compared. It reads the vendor's `cell_feature_matrix.h5` feature ids when the slide
-  provides one, so that **antibody channels are excluded**: on a protein add-on panel they otherwise take over
-  the variance ranking and are scored as if they were genes, and they cannot be spotted by name (an anti-CD3E
-  channel is called "CD3E", exactly like the RNA).
-- `eval_crossslide.py` — zero-shot: nothing on the test slide is fitted.
-- `eval_inslide.py` — five contiguous bands, decoder refit per fold, encoder frozen. **Not zero-shot**; do not
-  pool these numbers with the cross-slide ones.
-- `figures/` — spatial heat maps (measured vs predicted, within-panel z-scores) and per-gene PCC box plots.
-
-A gene the model cannot emit scores 0 and stays in the denominator, so methods with different output spaces
-stay comparable.
-
-## Repository layout
-
-```
-voice/           the package: encoder + LoRA, SE(2) decoder, NB head, retrieval, gate, gene space, IO
-  paths.py       every environment-dependent path, resolved from env vars or configs/default.yaml
-  encoder.py     UNI2-h + LoRA + cell-mask pooling  (the only thing the direct branch needs)
-  retrieval.py   the bank, exact top-K, per-gene-signature cross-slide retrieval
-  gate.py        the per-gene fusion weight: fitting, transferring, and the oracle upper bound
-predict/         segment -> crop -> predict; inputs.py holds the two slide layouts
-weights/         released weights go here (git-ignored; see weights/README.md)
-train/           Phase 1 and Phase 2, with the shipped hyper-parameters
-benchmark/       paper evaluations, canonical gene lists, figures
-tests/           parity test: the packaged forward reproduces the published predictions
-```
+Evaluation, ablation, and downstream inputs, commands, and outputs: [experiments/README.md](experiments/README.md).
 
 ## Citation
 
@@ -188,4 +90,3 @@ If you find VOICE useful in your research, please cite:
   year={2026}
 }
 ```
-

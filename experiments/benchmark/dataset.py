@@ -1,30 +1,4 @@
-"""What a benchmark slide is, and how to point the evaluation at your own.
-
-To score a prediction you need measured expression as well as images, so a benchmark slide is an H&E image
-paired with a spatial transcriptomics assay on the same tissue. One slide is a directory:
-
-    <slide>/
-        image.(svs|ndpi|tif|png)     H&E
-        cells.npz                    centroids + polygons, in the SAME pixel frame as the image
-        expression.npz               scipy sparse CSR [n_cells, n_genes], raw counts, rows aligned to cells.npz
-        genes.tsv                    one gene symbol per line, one per column of expression.npz
-        features.h5                  optional: the vendor's cell_feature_matrix.h5, ONLY needed if the panel has
-                                     antibody channels -- it is the only way to tell a protein channel from the
-                                     RNA of the same name (see voice/panel.py)
-
-`cells.npz` is exactly what `predict/segment.py` writes, so if your assay ships boundaries, convert them once and
-both prediction and evaluation read the same file. Row i of `expression.npz` must be the same cell as row i of
-`cells.npz` -- that alignment is asserted, not assumed.
-
-Describe your slides in a small YAML and pass it with `--slides`:
-
-    slides:
-      - name: my_breast_slide
-        dir:  /data/benchmark/my_breast_slide
-        mpp:  0.25
-      - name: my_lung_slide
-        dir:  /data/benchmark/my_lung_slide
-"""
+"""Load paired benchmark slides. Input: slide YAML and image/cell/expression/gene files. Output: aligned cells, expression, and RNA gene panels."""
 from __future__ import annotations
 import os
 import numpy as np
@@ -45,7 +19,7 @@ class BenchmarkSlide:
         for f in (self.cells, self.expression, self.genes_tsv):
             if not os.path.exists(f):
                 raise FileNotFoundError(f"{name}: missing {os.path.basename(f)} in {self.dir}\n"
-                                        f"  See benchmark/dataset.py for the expected layout.")
+                                        f"  See experiments/benchmark/dataset.py for the expected layout.")
 
     def _find_image(self):
         for f in sorted(os.listdir(self.dir)):

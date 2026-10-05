@@ -1,62 +1,20 @@
 #!/usr/bin/env python
-"""Predict single-cell gene expression, and per-cell embeddings, from H&E.
-
-Two ways to give it a slide.
-
-**A whole-slide image you just scanned.** Segment, then predict:
-
-    python predict/segment.py  --image slide.svs --out cells.npz --mpp 0.25
-    python predict/predict.py  --image slide.svs --cells cells.npz --mpp 0.25 \\
-                               --release weights/voice-23m --out pred.h5ad
-
-**A slide already prepared in the corpus layout** (`patch_cell_boundaries.npz` + `manifest.csv.gz` +
-`patches/`), which is what the training and benchmark data look like:
-
-    python predict/predict.py --prepared /data/slides/my_slide \\
-                              --release weights/voice-23m --out pred.h5ad
-
-The prepared path needs no `--mpp`: crops were cut at the right physical size when the slide was built, and the
-polygons are already in crop coordinates. It is also exactly reproducible, since the same PNG bytes reach the
-encoder every run. See `predict/inputs.py` for both layouts.
-
-**Embeddings.** `--save_embeddings` stores the 1536-d per-cell feature the gene head reads from, in
-`obsm["X_voice"]`. That vector is the model's representation of the cell's morphology, and it is what to use for
-downstream tasks — cell-type classification, clustering, integration — rather than the 6029 predicted genes,
-which are a lossy view of it. With `--embeddings_only` the gene head is skipped entirely.
-
-Cells are grouped into non-overlapping 256-px tiles so each is predicted once with its neighbours as spatial
-context, matching the evaluation protocol.
-
-**Stage 3.** With `--bank` the retrieval branch runs too, and `--gate` fuses the two per gene. Both are
-optional: without them you get the direct branch alone, which is what a slide with no reference cohort can
-have. Build a bank with `predict/build_bank.py`, and fit a gate with `benchmark/fit_gate.py`; the bank must be
-same-tissue, must exclude this slide, and must be embedded with these weights.
-
-    X            the fused prediction when a bank and gate are given, else the direct branch
-    layers["A"]  direct branch
-    layers["R"]  retrieval branch, NaN where no bank slide measures the gene
-    var["beta"]  the per-gene weight actually used
-"""
+"""Predict cell expression from H&E. Input: image and cell boundaries or prepared crops, model weights, and optional bank/gate. Output: AnnData predictions and optional cell features."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import numpy as np
 from voice import paths as _p
-_p.hf_home()                      # HF_HOME / *_OFFLINE before timm imports
+_p.hf_home()
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 from voice.encoder import pooled_feat, MEAN, STD
-from predict.geometry import tile, FOV_UM
+from predict.geometry import tile, FOV_UM, MPP_REF
 from predict.inputs import open_slide
 
 
 def panel_global_ids(release, genes_tsv, n_genes):
-    """Global gene ids for the head's output columns, in head order.
-
-    Retrieval needs to know WHICH gene each output column is, so it can ask the bank whether any reference
-    slide measures it. The head's gene table is that mapping.
-    """
     import pandas as pd
     p = genes_tsv or (os.path.join(release, "genes.tsv") if release else None)
     if not (p and os.path.exists(p)):
@@ -141,8 +99,9 @@ def main():
                      help="a retrieval bank directory from predict/build_bank.py. Must be the same tissue, must "
                           "NOT contain this slide, and must be embedded with these weights.")
     st3.add_argument("--gate", default=None,
-                     help="a gate JSON from benchmark/fit_gate.py (global gene id -> beta). Without it, --bank "
+                     help="a gate JSON from experiments/benchmark/fit_gate.py (global gene id -> beta). Without it, --bank "
                           "still reports the retrieval branch but X stays the direct branch.")
+    st3.add_argument("--exclude", nargs="*", default=None, help="reference slide names to exclude")
     st3.add_argument("--knn", type=int, default=200, help="neighbours retrieved per cell")
     st3.add_argument("--tau", type=float, default=0.03, help="softmax temperature on cosine similarity")
 
@@ -158,7 +117,7 @@ def main():
 
     want_emb = a.save_embeddings or a.embeddings_only
     want_genes = not a.embeddings_only
-    need_emb = want_emb or bool(a.bank)          # retrieval queries the bank with the same pooled feature
+    need_emb = want_emb or bool(a.bank)
 
     if a.release or (a.stage1 and a.stage2):
         s1, s2 = a.stage1, a.stage2
@@ -173,8 +132,7 @@ def main():
     source = open_slide(a.image, a.cells, a.prepared, a.mpp)
     print(f"[slide] {source.describe()}", flush=True)
     if source.kind == "wsi" and source.mpp is None:
-        print("[warn]  no resolution found. If the slide is not at ~0.2125 um/px, pass --mpp -- the crops would "
-              "otherwise cover the wrong amount of tissue and predictions degrade silently.", flush=True)
+        print(f"[warn] mpp unavailable; using {MPP_REF} um/px. Set --mpp for this slide.", flush=True)
 
     dev = torch.device(a.device)
     from voice.release import load_release
@@ -191,14 +149,17 @@ def main():
     emb_for_R = emb
     print(f"[run]   done in {time.time()-t0:.0f}s", flush=True)
 
-    # ---- Stage 3: retrieval branch, then the per-gene gate ----
+
     R = beta = None
     if a.bank and want_genes:
         from voice.retrieval import crossR
         from predict.build_bank import weights_id
         gid = panel_global_ids(a.release, a.genes, n_genes)
         t1 = time.time()
-        R_head, _cov = crossR(emb_for_R, gid, a.bank, K=a.knn, tau=a.tau,
+        exclude = set(a.exclude or [])
+        if a.prepared:
+            exclude.add(os.path.basename(os.path.abspath(a.prepared)))
+        R_head, _cov = crossR(emb_for_R, gid, a.bank, exclude=exclude, K=a.knn, tau=a.tau,
                               weights_id=weights_id(a.release, s1, s2), device=a.device)
         print(f"[R]     retrieval done in {time.time()-t1:.0f}s", flush=True)
         R = R_head
@@ -238,7 +199,7 @@ def main():
     obs = pd.DataFrame(dict(y_pixel=source.pos[:, 0], x_pixel=source.pos[:, 1]),
                        index=pd.Index(source.ids, name="cell_id"))
     A = ad.AnnData(X=X, obs=obs, var=var)
-    A.obsm["spatial"] = source.pos[:, ::-1].copy()          # (x, y), the scanpy convention
+    A.obsm["spatial"] = source.pos[:, ::-1].copy()
     if want_emb:
         A.obsm["X_voice"] = emb
     if R is not None:

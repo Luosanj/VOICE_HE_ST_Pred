@@ -1,4 +1,4 @@
-"""Config loading (+ smoke overrides), seeding, small helpers."""
+"""Load configurations and initialize random seeds. Input: YAML configuration and seed. Output: resolved configuration and seeded generators."""
 from __future__ import annotations
 import os, random
 import numpy as np
@@ -26,8 +26,7 @@ def load_config(path, smoke=False):
 
 
 def apply_reference_mode(cfg, reference_mode=None):
-    """Resolve the reference mode and point precompute_dir at the matching cache. self_slide writes/reads
-    a separate `_selfslide` dir so its (transductive) numbers never mix with the cross_slide cache."""
+    """Set precompute_dir for the selected reference mode."""
     if reference_mode:
         cfg.retrieval.reference_mode = reference_mode
     if cfg.retrieval.reference_mode == "self_slide":

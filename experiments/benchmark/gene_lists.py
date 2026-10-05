@@ -1,35 +1,18 @@
 #!/usr/bin/env python
-"""Build the canonical HVG / SVG gene lists a slide is scored on.
-
-    python benchmark/gene_lists.py --slides slides.yaml --out gene_lists/
-
-The lists depend only on the MEASURED expression and the cell coordinates -- never on a model. That is the point:
-every method being compared is scored on the same genes, and a method that cannot predict one of them takes a
-correlation of 0 for it rather than having it quietly removed from its denominator.
-
-    real genes = not a control probe, and not an antibody channel   (voice/panel.py)
-    HVG rank   = descending variance of measured log1p
-    SVG rank   = descending Moran's I on a 6-NN graph of the cell coordinates
-
-Protein channels are excluded via the vendor h5 when the slide provides one. On a protein add-on panel this is
-not cosmetic: antibody staining has a much wider dynamic range than RNA counts, so the protein channels take over
-the top of the variance ranking, and the "highly variable genes" stop being genes at all.
-
-Writes one <slide>.tsv per slide plus SUMMARY.tsv, and refuses to overwrite either.
-"""
+"""Build canonical evaluation panels. Input: measured expression, cell coordinates, and optional vendor feature types. Output: HVG/SVG-ranked gene TSVs."""
 from __future__ import annotations
 import os, sys, argparse, time, pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 import numpy as np, pandas as pd
 
-from benchmark.dataset import load_slides
+from experiments.benchmark.dataset import load_slides
 from voice.metrics_bench import rank_hvg_svg
 from voice.panel import sym2glob_map
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slides", required=True, help="YAML describing your slides (see benchmark/dataset.py)")
+    ap.add_argument("--slides", required=True, help="YAML describing your slides (see experiments/benchmark/dataset.py)")
     ap.add_argument("--out", required=True, help="output directory (must not already contain these files)")
     ap.add_argument("--global_genes", default=None,
                     help="TSV with columns gene_symbol, global_gene_index -- the model head's gene table. "
