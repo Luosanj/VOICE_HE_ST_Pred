@@ -50,7 +50,7 @@ def main():
     if a.bank_dir:save_bank_slide(a.bank_dir,a.name or Path(a.prepared).name,E,Y,source.pos,panel,identity)
     else:
         Path(a.out).parent.mkdir(parents=True,exist_ok=True)
-        np.savez_compressed(a.out,E1536=E,Ylog=Y,pos=source.pos,panel=panel,genes=genes,weights_id=identity,slide=a.name or Path(a.prepared).name)
+        np.savez_compressed(a.out,E1536=E,Ylog=Y,pos=source.pos,panel=panel,genes=genes,expr_rows=source.er,weights_id=identity,slide=a.name or Path(a.prepared).name)
 
 
 if __name__=='__main__':main()

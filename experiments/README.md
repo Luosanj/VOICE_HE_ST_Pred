@@ -10,6 +10,8 @@ Run entries from the repository root with `python -m`. Supply your own data, mod
 | `benchmark.fit_gate` | Reference slides, model weights, and bank | Per-gene fusion weights |
 | `ablation.encoder_features` | Prepared slides, frozen UNI2-h or aligned encoder weights | Query features or per-slide reference banks |
 | `ablation.retrieval_alignment` | Matched query features and banks for each encoder variant | Covered-gene retrieval PCC |
+| `ablation.alignment_projection` | Frozen UNI2-h features and paired scFoundation embeddings | 128-D alignment tower weights |
+| `ablation.inslide_components` | Matched frozen/Stage-1/Stage-2 features and projection/decoder weights | Component rows 2–9, five-fold predictions and fitted decoders |
 | `ablation.gate_methods` | Spatial out-of-fold branch predictions, band IDs, canonical gene lists | Grid/MLP PCC tables |
 | `ablation.cache_references` | Model weights, same-tissue prepared slides, excluding banks | Reference A/R/Y NPZ caches |
 | `ablation.beta_stability` | Reference caches and original target branch caches | Beta support, SD, pair correlations, pooled/global comparisons |
@@ -53,6 +55,52 @@ python -m experiments.ablation.retrieval_alignment --slides retrieval_slides.yam
 ```
 
 Repeat extraction for Stage 1 using separate bank/query paths. Evaluation YAML: `slides` list with `name`, optional `exclude`, and `variants` mapping labels to `query` and `bank` paths. It verifies matching reference-slide names, query cells, expression, and genes, then scores genes covered by every variant. Defaults: K=200, tau=0.03.
+
+## In-slide components (rows 2–9)
+
+```bash
+python -m experiments.ablation.inslide_components --config components.yaml \
+  --protocol 7m --out results/components_7m
+```
+
+Use `--protocol 23m` with the corresponding 23M weights and feature files. `--rows 2,3,4,5,6` runs only retrieval; row 9 also runs rows 6 and 8. Outputs: `results.tsv`, `macro.tsv`, and `<slide>/row<number>/{predictions.npz,pergene.tsv}`. Rows 7/8 also save each fold's selected decoder and validation log; row 9 includes `Apred`, `Rr`, `Spred`, two cross-fit beta vectors, and their cell assignments.
+
+| Row | Computation | Required input |
+| --- | --- | --- |
+| 2 | Ridge λ=100, cosine retrieval K=20, tau=1 | Frozen features |
+| 3 | 1536→512→128 alignment projection, retrieval K=20, tau=1 | Frozen features and projection tower |
+| 4 | Encoder-output retrieval K=200, tau=0.03 | Frozen features |
+| 5 | Encoder-output retrieval K=200, tau=0.03 | Stage-1 features |
+| 6 | Encoder-output retrieval K=200, tau=0.03 | Stage-2 features |
+| 7 | Spatial decoder fine-tuning with the encoder frozen | Frozen features and frozen-encoder decoder |
+| 8 | Spatial decoder fine-tuning with the encoder frozen | Stage-2 features and Stage-2 decoder |
+| 9 | Per-gene fusion of rows 8 and 6, 41-point beta grid | Rows 8 and 6 |
+
+```yaml
+projection: /models/clip_he_tower.pt
+heads:
+  frozen: /models/frozen_decoder.pt
+  stage2: /models/stage2.pt
+slides:
+  - name: target
+    features:
+      frozen: /data/features/target_frozen.npz
+      stage1: /data/features/target_stage1.npz
+      stage2: /data/features/target_stage2.npz
+```
+
+Feature NPZs contain `E1536 [N,1536]`, measured `Ylog [N,G]`, source-pixel `pos [N,2]` in `(y,x)` order, head gene indices `panel [G]`, and `genes [G]`. Optional `expr_rows [N]` identifies expression rows; optional `Yraw [N,G]` supplies raw counts for NB loss. Cells, positions, expression, and gene order must match across variants. Use `ablation.encoder_features --out` above to generate these files from prepared slides. Row 3 uses the frozen-feature tower, with its saved input mean/SD. Decoder weights accept Stage-2 `se2` checkpoints (`.pt` or `.safetensors`) or frozen-baseline `model` checkpoints; each decoder must match its feature variant and panel indices.
+
+Five x-quantile bands define held-out folds. Retrieval uses measured expression from the other four bands. Rows 7/8 use overlapping 256-pixel patches (30-pixel overlap, 2–200 cells), AdamW lr=1e-4, weight decay=1e-4, up to 50 epochs, and patience=5. Epoch selection uses a spatial validation strip from the training bands (`inner_frac=0.1`). Fine-tuning loss is log1p-MSE for 7M and MSE + 0.5 NB-NLL for 23M; `--nb_weight` overrides it. Row 9 fits beta on one random half and predicts the other, seed 0. PCC is computed once over pooled full-slide predictions; Macro averages slides. HVG/SVG rankings use full-slide measured expression, or `--gene_lists` supplies canonical rankings.
+
+To train the row-3 tower, provide a YAML `slides` list with `features` (frozen-feature NPZ) and `scf` (3072-D scFoundation `.npy`, indexed by `expr_rows`; already aligned rows when omitted). Supply only training slides:
+
+```bash
+python -m experiments.ablation.alignment_projection --slides projection_training.yaml \
+  --out /models/projection
+```
+
+Defaults: 1536/3072→512→128 towers, symmetric InfoNCE, 15 epochs, batch=8192, lr=1e-3, seed=0, proportional sampling up to 4 million pairs. Outputs: `clip_he_tower.pt` and `clip_scf_tower.pt`. The existing `voice.scale_train` entry trains a frozen-feature decoder from your training cache; row 7 uses that decoder, while row 8 uses the corresponding Stage-2 decoder.
 
 ## No-Stage-1 training
 
