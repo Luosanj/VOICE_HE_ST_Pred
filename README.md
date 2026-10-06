@@ -1,4 +1,8 @@
-# VOICE
+# VOICE: A Vision-Omics Foundation Model Integrating Direct and Retrieval-Based Prediction of In-situ Single-Cell Gene Expression
+
+Authors: Xin Luo, Yicheng Tao, Haoxuan Zeng, Suyuan Wang, Chenzi Ouyang, Meiqi Zhu, Kai Liu, Shuibing Chen, and Jie Liu.
+
+The preprint is available [here](https://arxiv.org/abs/2608.08366).
 
 Predict single-cell gene expression from H&E with UNI2-h, a spatial decoder, and reference-cell retrieval.
 
