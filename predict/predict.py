@@ -157,7 +157,9 @@ def main():
         gid = panel_global_ids(a.release, a.genes, n_genes)
         t1 = time.time()
         exclude = set(a.exclude or [])
-        if a.prepared:
+        from voice.tissue_bank import is_tissue_bank
+        pooled_bank = is_tissue_bank(a.bank)
+        if a.prepared and not pooled_bank:
             exclude.add(os.path.basename(os.path.abspath(a.prepared)))
         R_head, _cov = crossR(emb_for_R, gid, a.bank, exclude=exclude, K=a.knn, tau=a.tau,
                               weights_id=weights_id(a.release, s1, s2), device=a.device)

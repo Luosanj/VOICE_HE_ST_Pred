@@ -2,9 +2,12 @@
 
 Authors: Xin Luo, Yicheng Tao, Haoxuan Zeng, Suyuan Wang, Chenzi Ouyang, Meiqi Zhu, Kai Liu, Shuibing Chen, and Jie Liu.
 
-The preprint is available [here](https://arxiv.org/abs/2608.08366).
-
 Predict single-cell gene expression from H&E with UNI2-h, a spatial decoder, and reference-cell retrieval.
+
+## Resources
+
+- **Model:** [Hugging Face](https://huggingface.co/zchx/VOICE-23M)
+- **Paper:** [arXiv:2608.08366](https://arxiv.org/abs/2608.08366)
 
 ## Setup
 
@@ -16,6 +19,25 @@ For `predict/segment.py`, also install `cellpose>=4.0` and `opencv-python-headle
 
 UNI2-h access and weights: [MahmoodLab/UNI2-h](https://huggingface.co/MahmoodLab/UNI2-h).
 Set paths in `configs/default.yaml` or `VOICE_*` environment variables. See [training inputs](#training-and-evaluation) and [model weights](weights/README.md).
+
+## Download the model
+
+Choose your own Hugging Face cache location. After obtaining [UNI2-h](https://huggingface.co/MahmoodLab/UNI2-h) access, authenticate with your account and download the model:
+
+```bash
+export VOICE_HF_HOME=/path/to/huggingface/cache
+export HF_HOME="$VOICE_HF_HOME"
+hf auth login
+python - <<'PYTHON'
+from huggingface_hub import snapshot_download
+
+snapshot_download("zchx/VOICE-23M", local_dir="models/voice23m",
+                  allow_patterns=["stage*.safetensors", "config.json", "genes.tsv", "LICENSE"])
+snapshot_download("MahmoodLab/UNI2-h")
+PYTHON
+```
+
+Keep `VOICE_HF_HOME` set to this cache when running prediction. Download a tissue bank separately as shown below; downloading the entire model repository also downloads all reference tissues.
 
 ## Prediction
 
@@ -41,6 +63,28 @@ Whole-slide crops cover 55 µm and are resized to 224×224. Prepared crops must 
 Output: AnnData `X` with direct log1p predictions or fused gene scores, `obsm["spatial"]` with coordinates, and optional `obsm["X_voice"]` with 1536-dimensional cell features.
 
 ## Retrieval and fusion
+
+The released bank contains all 23,232,915 training reference cells, pooled and shuffled within tissue types. Image features are L2-normalized and expression is already standardized before pooling; prediction does not standardize it again. The files contain paired features, expression and measured-gene information, without original slide names, cell identifiers, image coordinates or source paths.
+
+Download the tissue you need, for example lung:
+
+```bash
+python - <<'PYTHON'
+from huggingface_hub import snapshot_download
+
+snapshot_download("zchx/VOICE-23M", local_dir="models/voice23m",
+                  allow_patterns=["bank/lung/*", "beta/lung.json"])
+PYTHON
+python predict/predict.py --prepared /data/target --release models/voice23m \
+  --bank models/voice23m/bank/lung --gate models/voice23m/beta/lung.json \
+  --out pred.h5ad
+```
+
+Use `--image /path/to/slide.svs --cells /path/to/cells.npz --mpp 0.25` instead of `--prepared` for an image. Use the actual image resolution. Existing fusion weights are provided for breast, kidney, lung, ovary and pancreas; genes without a fitted weight use the direct prediction. With `--bank` and no `--gate`, retrieval is saved in `layers['R']` and `X` contains the direct prediction.
+
+Use pooled banks with independent query slides. Source-level selection and exclusion are unavailable after pooling. [Bank formats and data terms](weights/README.md) describe the download layout and source licenses.
+
+### Build a bank from your own references
 
 Input: same-tissue reference slides with measured `expression.npz` and `genes.tsv`; model weights must match the query. Exclude the target and its duplicate sections from references. Genes without retrieval or fitted weights use the direct branch.
 

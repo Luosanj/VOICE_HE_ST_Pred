@@ -33,6 +33,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
+    from voice.tissue_bank import is_tissue_bank
+    if is_tissue_bank(a.bank):
+        raise SystemExit('Gate fitting requires a slide-resolved bank for leave-one-reference-out exclusion; '
+                         'build one from your own prepared references with predict/build_bank.py.')
+
     if len(a.prepared) < 2:
         raise SystemExit("give at least two reference slides: each is retrieved from a bank that excludes it, "
                          "so a single reference leaves an empty bank.")

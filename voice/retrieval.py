@@ -109,6 +109,11 @@ def bank_panels(bank_dir, names):
 
 def crossR(Eq, panel_q, bank_dir, names=None, K=K_DEFAULT, tau=TAU_DEFAULT,
            weights_id=None, device="cuda", verbose=True, exclude=None):
+    from voice.tissue_bank import is_tissue_bank
+    if is_tissue_bank(bank_dir):
+        from voice.tissue_bank import crossR as tissue_crossR
+        return tissue_crossR(Eq, panel_q, bank_dir, K=K, tau=tau, weights_id=weights_id,
+                             device=device, verbose=verbose, names=names, exclude=exclude)
     import gc
     names = list_bank(bank_dir) if names is None else names
     excluded = set(exclude or [])
