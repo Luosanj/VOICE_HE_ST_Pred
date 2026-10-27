@@ -9,6 +9,14 @@ Predict single-cell gene expression from H&E with UNI2-h, a spatial decoder, and
 - **Model:** [Hugging Face](https://huggingface.co/zchx/VOICE-23M)
 - **Paper:** [arXiv:2608.08366](https://arxiv.org/abs/2608.08366)
 
+## Featured in
+
+[![Mentioned in Awesome](https://awesome.re/mentioned-badge.svg)](https://github.com/seandavi/awesome-single-cell)
+
+- [awesome-single-cell](https://github.com/seandavi/awesome-single-cell) — *Spatial transcriptomics*
+- [awesome-multimodal-in-medical-imaging](https://github.com/richard-peng-xia/awesome-multimodal-in-medical-imaging) — *Histology–Spatial Transcriptomics Multimodal Models*
+- [awesome-foundation-model-single-cell-papers](https://github.com/OmicsML/awesome-foundation-model-single-cell-papers) — *Spatial, Proteomics and Histology*
+
 ## Setup
 
 ```bash
