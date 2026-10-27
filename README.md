@@ -148,3 +148,7 @@ If you find VOICE useful in your research, please cite:
   year={2026}
 }
 ```
+
+## License
+
+MIT (see [LICENSE](LICENSE)). Third-party components, including the separately downloaded UNI2-h weights, are listed in [NOTICE](NOTICE).
