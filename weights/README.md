@@ -26,6 +26,12 @@ Stage 1 supplies the LoRA adapter; Stage 2 overlays its trained adapter tensors 
 
 Build reference banks with the same encoder checkpoints used for the query.
 
+## Fusion weights
+
+Download `beta/TISSUE.json` with the matching `bank/TISSUE/` directory. Fusion weights are available for bone, breast, colon, kidney, liver, lung, ovary, pancreas, skin and tonsil. Each file maps global gene IDs from `genes.tsv` to weights in `[0, 1]`, fitted using same-tissue leave-one-reference-out retrieval and averaged per gene. Genes without a fitted weight use the direct prediction.
+
+Brain, cervix, heart, lymph_node and prostate each have one training reference slide, so no fusion weights are supplied under this fitting protocol. Their banks can still provide retrieval scores with `--bank` alone.
+
 ## Released tissue banks
 
 Each tissue directory contains a manifest and compressed HDF5 shards. Shards store `E` as float16 normalized cell features. Under `gene_sets`, each group stores measured global gene IDs, shard-local row indices and float16 standardized expression `Y`. Grouping describes measured gene sets, not source slides. All cell axes remain paired when shuffled.

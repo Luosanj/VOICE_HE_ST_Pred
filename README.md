@@ -88,7 +88,9 @@ python predict/predict.py --prepared /data/target --release models/voice23m \
   --out pred.h5ad
 ```
 
-Use `--image /path/to/slide.svs --cells /path/to/cells.npz --mpp 0.25` instead of `--prepared` for an image. Use the actual image resolution. Existing fusion weights are provided for breast, kidney, lung, ovary and pancreas; genes without a fitted weight use the direct prediction. With `--bank` and no `--gate`, retrieval is saved in `layers['R']` and `X` contains the direct prediction.
+Use `--image /path/to/slide.svs --cells /path/to/cells.npz --mpp 0.25` instead of `--prepared` for an image. Use the actual image resolution. Fusion weights are provided for bone, breast, colon, kidney, liver, lung, ovary, pancreas, skin and tonsil. Use `bank/TISSUE/` and `beta/TISSUE.json` for the same tissue; genes without a fitted weight use the direct prediction.
+
+Brain, cervix, heart, lymph_node and prostate each have one training reference slide, so same-tissue leave-one-reference-out fitting is unavailable and no fusion weights are supplied. With `--bank` and no `--gate`, retrieval is saved in `layers['R']` and `X` contains the direct prediction.
 
 Use pooled banks with independent query slides. Source-level selection and exclusion are unavailable after pooling. [Bank formats and data terms](weights/README.md) describe the download layout and source licenses.
 
